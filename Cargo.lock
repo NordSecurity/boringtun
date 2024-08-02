@@ -471,6 +471,38 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c007b1ae3abe1cb6f85a16305acd418b7ca6343b953633fee2b76d8f108b830f"
 
 [[package]]
+name = "freetun"
+version = "0.6.0"
+dependencies = [
+ "aead",
+ "base64",
+ "blake2",
+ "chacha20poly1305",
+ "criterion",
+ "dispatch",
+ "etherparse",
+ "hex",
+ "hmac",
+ "ip_network",
+ "ip_network_table",
+ "jni",
+ "libc",
+ "mock_instant",
+ "nix",
+ "parking_lot",
+ "rand",
+ "rand_core",
+ "ring",
+ "socket2 0.5.6",
+ "thiserror",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "untrusted",
+ "x25519-dalek",
+]
+
+[[package]]
 name = "generic-array"
 version = "0.14.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
