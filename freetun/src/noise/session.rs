@@ -1,7 +1,7 @@
 // Copyright (c) 2019 Cloudflare, Inc. All rights reserved.
 // SPDX-License-Identifier: BSD-3-Clause
 
-use super::PacketData;
+use super::{Packet, PacketData};
 use crate::noise::errors::WireGuardError;
 use parking_lot::Mutex;
 use ring::aead::{Aad, LessSafeKey, Nonce, UnboundKey, CHACHA20_POLY1305};
@@ -193,14 +193,14 @@ impl Session {
     /// src - an IP packet from the interface
     /// dst - pre-allocated space to hold the encapsulating UDP packet to send over the network
     /// returns the size of the formatted packet
-    pub(super) fn format_packet_data<'a>(&self, src: &[u8], dst: &'a mut [u8]) -> &'a mut [u8] {
-        if dst.len() < src.len() + super::DATA_OVERHEAD_SZ {
+    pub(super) fn encrypt(&self, packet: &mut Packet) {
+        if packet.header().len() == super::DATA_OVERHEAD_SZ {
             panic!("The destination buffer is too small");
         }
 
         let sending_key_counter = self.sending_key_counter.fetch_add(1, Ordering::Relaxed) as u64;
 
-        let (message_type, rest) = dst.split_at_mut(4);
+        let (message_type, rest) = packet.msg().split_at_mut(4);
         let (receiver_index, rest) = rest.split_at_mut(4);
         let (counter, data) = rest.split_at_mut(8);
 
@@ -212,12 +212,12 @@ impl Session {
         let n = {
             let mut nonce = [0u8; 12];
             nonce[4..12].copy_from_slice(&sending_key_counter.to_le_bytes());
-            data[..src.len()].copy_from_slice(src);
+            // data[..src.len()].copy_from_slice(src);
             self.sender
                 .seal_in_place_separate_tag(
                     Nonce::assume_unique_for_key(nonce),
                     Aad::from(&[]),
-                    &mut data[..src.len()],
+                    &mut data[..],
                 )
                 .map(|tag| {
                     data[src.len()..src.len() + AEAD_SIZE].copy_from_slice(tag.as_ref());

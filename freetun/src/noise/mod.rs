@@ -1,14 +1,15 @@
 // Copyright (c) 2019 Cloudflare, Inc. All rights reserved.
 // SPDX-License-Identifier: BSD-3-Clause
 
+pub mod dev;
 pub mod errors;
 pub mod handshake;
 pub mod rate_limiter;
 pub mod safe_duration;
+pub mod session;
 
 #[cfg(test)]
 mod integration_tests;
-mod session;
 mod timers;
 
 use crate::noise::errors::WireGuardError;
@@ -90,6 +91,30 @@ const HANDSHAKE_RESP_SZ: usize = 92;
 const COOKIE_REPLY_SZ: usize = 64;
 const DATA_OVERHEAD_SZ: usize = 32;
 
+pub struct Packet {
+    /// Overhead bytes, not storring anything usefull
+    pub overhead: usize,
+    /// Offset to payload, offset - overhead is used for header
+    pub offset: usize,
+    /// Underlying buffer
+    pub buf: Vec<u8>,
+}
+
+impl Packet {
+    /// Full message, header + payload
+    pub fn msg(&mut self) -> &mut [u8] {
+        &mut self.buf[self.overhead..]
+    }
+
+    pub fn header(&mut self) -> &mut [u8] {
+        &mut self.buf[self.overhead..self.offset]
+    }
+
+    pub fn payload(&mut self) -> &mut [u8] {
+        &mut self.buf[self.offset..]
+    }
+}
+
 #[derive(Debug)]
 pub struct HandshakeInit<'a> {
     sender_idx: u32,
@@ -122,7 +147,7 @@ pub struct PacketData<'a> {
 
 /// Describes a packet from network
 #[derive(Debug)]
-pub enum Packet<'a> {
+pub enum TaggedPacket<'a> {
     HandshakeInit(HandshakeInit<'a>),
     HandshakeResponse(HandshakeResponse<'a>),
     PacketCookieReply(PacketCookieReply<'a>),
@@ -135,7 +160,7 @@ impl Tunn {
     }
 
     #[inline(always)]
-    pub fn parse_incoming_packet(src: &[u8]) -> Result<Packet, WireGuardError> {
+    pub fn parse_incoming_packet(src: &[u8]) -> Result<TaggedPacket, WireGuardError> {
         if src.len() < 4 {
             return Err(WireGuardError::InvalidPacket);
         }
@@ -144,26 +169,28 @@ impl Tunn {
         let packet_type = u32::from_le_bytes(src[0..4].try_into().unwrap());
 
         Ok(match (packet_type, src.len()) {
-            (HANDSHAKE_INIT, HANDSHAKE_INIT_SZ) => Packet::HandshakeInit(HandshakeInit {
+            (HANDSHAKE_INIT, HANDSHAKE_INIT_SZ) => TaggedPacket::HandshakeInit(HandshakeInit {
                 sender_idx: u32::from_le_bytes(src[4..8].try_into().unwrap()),
                 unencrypted_ephemeral: <&[u8; 32] as TryFrom<&[u8]>>::try_from(&src[8..40])
                     .expect("length already checked above"),
                 encrypted_static: &src[40..88],
                 encrypted_timestamp: &src[88..116],
             }),
-            (HANDSHAKE_RESP, HANDSHAKE_RESP_SZ) => Packet::HandshakeResponse(HandshakeResponse {
-                sender_idx: u32::from_le_bytes(src[4..8].try_into().unwrap()),
-                receiver_idx: u32::from_le_bytes(src[8..12].try_into().unwrap()),
-                unencrypted_ephemeral: <&[u8; 32] as TryFrom<&[u8]>>::try_from(&src[12..44])
-                    .expect("length already checked above"),
-                encrypted_nothing: &src[44..60],
-            }),
-            (COOKIE_REPLY, COOKIE_REPLY_SZ) => Packet::PacketCookieReply(PacketCookieReply {
+            (HANDSHAKE_RESP, HANDSHAKE_RESP_SZ) => {
+                TaggedPacket::HandshakeResponse(HandshakeResponse {
+                    sender_idx: u32::from_le_bytes(src[4..8].try_into().unwrap()),
+                    receiver_idx: u32::from_le_bytes(src[8..12].try_into().unwrap()),
+                    unencrypted_ephemeral: <&[u8; 32] as TryFrom<&[u8]>>::try_from(&src[12..44])
+                        .expect("length already checked above"),
+                    encrypted_nothing: &src[44..60],
+                })
+            }
+            (COOKIE_REPLY, COOKIE_REPLY_SZ) => TaggedPacket::PacketCookieReply(PacketCookieReply {
                 receiver_idx: u32::from_le_bytes(src[4..8].try_into().unwrap()),
                 nonce: &src[8..32],
                 encrypted_cookie: &src[32..64],
             }),
-            (DATA, DATA_OVERHEAD_SZ..=std::usize::MAX) => Packet::PacketData(PacketData {
+            (DATA, DATA_OVERHEAD_SZ..=std::usize::MAX) => TaggedPacket::PacketData(PacketData {
                 receiver_idx: u32::from_le_bytes(src[4..8].try_into().unwrap()),
                 counter: u64::from_le_bytes(src[8..16].try_into().unwrap()),
                 encrypted_encapsulated_packet: &src[16..],
@@ -274,7 +301,7 @@ impl Tunn {
         let current = self.current;
         if let Some(ref session) = self.sessions[current % N_SESSIONS] {
             // Send the packet using an established session
-            let packet = session.format_packet_data(src, dst);
+            let packet = session.encrypt(src, dst);
             self.timer_tick(TimerName::TimeLastPacketSent);
             // Exclude Keepalive packets from timer update.
             if !src.is_empty() {
@@ -332,14 +359,14 @@ impl Tunn {
 
     pub(crate) fn handle_verified_packet<'a>(
         &mut self,
-        packet: Packet,
+        packet: TaggedPacket,
         dst: &'a mut [u8],
     ) -> TunnResult<'a> {
         match packet {
-            Packet::HandshakeInit(p) => self.handle_handshake_init(p, dst),
-            Packet::HandshakeResponse(p) => self.handle_handshake_response(p, dst),
-            Packet::PacketCookieReply(p) => self.handle_cookie_reply(p),
-            Packet::PacketData(p) => self.handle_data(p, dst),
+            TaggedPacket::HandshakeInit(p) => self.handle_handshake_init(p, dst),
+            TaggedPacket::HandshakeResponse(p) => self.handle_handshake_response(p, dst),
+            TaggedPacket::PacketCookieReply(p) => self.handle_cookie_reply(p),
+            TaggedPacket::PacketData(p) => self.handle_data(p, dst),
         }
         .unwrap_or_else(TunnResult::from)
     }
@@ -392,7 +419,7 @@ impl Tunn {
         // Increase the rx_bytes accordingly
         self.rx_bytes += HANDSHAKE_RESP_SZ;
 
-        let keepalive_packet = session.format_packet_data(&[], dst);
+        let keepalive_packet = session.encrypt(&[], dst);
         // Store new session in ring buffer
         let l_idx = session.local_index();
         let index = l_idx % N_SESSIONS;
@@ -737,7 +764,7 @@ mod tests {
             unreachable!();
         };
         let packet = Tunn::parse_incoming_packet(packet_data).unwrap();
-        assert!(matches!(packet, Packet::HandshakeInit(_)));
+        assert!(matches!(packet, TaggedPacket::HandshakeInit(_)));
     }
 
     #[test]
@@ -750,7 +777,7 @@ mod tests {
         let (mut my_tun, _their_tun) = create_two_tuns();
         let init = create_handshake_init(&mut my_tun);
         let packet = Tunn::parse_incoming_packet(&init).unwrap();
-        assert!(matches!(packet, Packet::HandshakeInit(_)));
+        assert!(matches!(packet, TaggedPacket::HandshakeInit(_)));
     }
 
     #[test]
@@ -759,7 +786,7 @@ mod tests {
         let init = create_handshake_init(&mut my_tun);
         let resp = create_handshake_response(&mut their_tun, &init);
         let packet = Tunn::parse_incoming_packet(&resp).unwrap();
-        assert!(matches!(packet, Packet::HandshakeResponse(_)));
+        assert!(matches!(packet, TaggedPacket::HandshakeResponse(_)));
     }
 
     #[test]
@@ -769,7 +796,7 @@ mod tests {
         let resp = create_handshake_response(&mut their_tun, &init);
         let keepalive = parse_handshake_resp(&mut my_tun, &resp);
         let packet = Tunn::parse_incoming_packet(&keepalive).unwrap();
-        assert!(matches!(packet, Packet::PacketData(_)));
+        assert!(matches!(packet, TaggedPacket::PacketData(_)));
     }
 
     #[test]
@@ -811,7 +838,7 @@ mod tests {
 
         let init = create_handshake_init(&mut my_tun);
         let packet = Tunn::parse_incoming_packet(&init).unwrap();
-        assert!(matches!(packet, Packet::HandshakeInit(_)));
+        assert!(matches!(packet, TaggedPacket::HandshakeInit(_)));
 
         mock_instant::MockClock::advance(REKEY_TIMEOUT.into());
         update_timer_results_in_handshake(&mut my_tun)

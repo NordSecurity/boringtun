@@ -1,6 +1,8 @@
 use super::handshake::{b2s_hash, b2s_keyed_mac_16, b2s_keyed_mac_16_2, b2s_mac_24};
 use crate::noise::handshake::{LABEL_COOKIE, LABEL_MAC1};
-use crate::noise::{HandshakeInit, HandshakeResponse, Packet, Tunn, TunnResult, WireGuardError};
+use crate::noise::{
+    HandshakeInit, HandshakeResponse, TaggedPacket, Tunn, TunnResult, WireGuardError,
+};
 
 #[cfg(feature = "mock-instant")]
 use mock_instant::Instant;
@@ -155,12 +157,12 @@ impl RateLimiter {
         src_addr: Option<IpAddr>,
         src: &'a [u8],
         dst: &'b mut [u8],
-    ) -> Result<Packet<'a>, TunnResult<'b>> {
+    ) -> Result<TaggedPacket<'a>, TunnResult<'b>> {
         let packet = Tunn::parse_incoming_packet(src)?;
 
         // Verify and rate limit handshake messages only
-        if let Packet::HandshakeInit(HandshakeInit { sender_idx, .. })
-        | Packet::HandshakeResponse(HandshakeResponse { sender_idx, .. }) = packet
+        if let TaggedPacket::HandshakeInit(HandshakeInit { sender_idx, .. })
+        | TaggedPacket::HandshakeResponse(HandshakeResponse { sender_idx, .. }) = packet
         {
             let (msg, macs) = src.split_at(src.len() - 32);
             let (mac1, mac2) = macs.split_at(16);

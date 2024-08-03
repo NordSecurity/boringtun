@@ -39,7 +39,7 @@ use std::thread;
 use crate::noise::errors::WireGuardError;
 use crate::noise::handshake::parse_handshake_anon;
 use crate::noise::rate_limiter::RateLimiter;
-use crate::noise::{Packet, Tunn, TunnResult};
+use crate::noise::{TaggedPacket, Tunn, TunnResult};
 use crate::x25519;
 use allowed_ips::AllowedIps;
 use peer::{AllowedIP, Peer};
@@ -812,16 +812,16 @@ impl Device {
                         };
 
                     let peer = match &parsed_packet {
-                        Packet::HandshakeInit(p) => {
+                        TaggedPacket::HandshakeInit(p) => {
                             parse_handshake_anon(private_key, public_key, p)
                                 .ok()
                                 .and_then(|hh| {
                                     d.peers.get(&x25519::PublicKey::from(hh.peer_static_public))
                                 })
                         }
-                        Packet::HandshakeResponse(p) => d.peers_by_idx.get(&(p.receiver_idx >> 8)),
-                        Packet::PacketCookieReply(p) => d.peers_by_idx.get(&(p.receiver_idx >> 8)),
-                        Packet::PacketData(p) => d.peers_by_idx.get(&(p.receiver_idx >> 8)),
+                        TaggedPacket::HandshakeResponse(p) => d.peers_by_idx.get(&(p.receiver_idx >> 8)),
+                        TaggedPacket::PacketCookieReply(p) => d.peers_by_idx.get(&(p.receiver_idx >> 8)),
+                        TaggedPacket::PacketData(p) => d.peers_by_idx.get(&(p.receiver_idx >> 8)),
                     };
 
                     let peer = match peer {
