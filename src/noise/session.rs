@@ -1,9 +1,8 @@
 // Copyright (c) 2019 Cloudflare, Inc. All rights reserved.
 // SPDX-License-Identifier: BSD-3-Clause
 
-use super::{Packet, PacketData};
+use super::packet::{Packet, PacketData};
 use crate::noise::errors::WireGuardError;
-use nix::NixPath;
 use parking_lot::Mutex;
 use ring::aead::{Aad, LessSafeKey, Nonce, UnboundKey, CHACHA20_POLY1305};
 use std::sync::atomic::{AtomicUsize, Ordering};

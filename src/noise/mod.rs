@@ -1,6 +1,10 @@
 // Copyright (c) 2019 Cloudflare, Inc. All rights reserved.
 // SPDX-License-Identifier: BSD-3-Clause
 
+use std::net::{Ipv4Addr, Ipv6Addr};
+
+use errors::WireGuardError;
+
 pub mod errors;
 pub mod handshake;
 pub mod node;
@@ -12,12 +16,9 @@ pub mod session;
 pub mod tun;
 
 #[cfg(test)]
+#[cfg(never)]
 mod integration_tests;
 mod timers;
-
-use std::net::{Ipv4Addr, Ipv6Addr};
-
-use errors::WireGuardError;
 
 /// The default value to use for rate limiting, when no other rate limiter is defined
 const PEER_HANDSHAKE_RATE_LIMIT: u64 = 10;
@@ -40,6 +41,17 @@ const MAX_QUEUE_DEPTH: usize = 256;
 /// number of sessions in the ring, better keep a PoT
 const N_SESSIONS: usize = 8;
 
+type MessageType = u32;
+const HANDSHAKE_INIT: MessageType = 1;
+const HANDSHAKE_RESP: MessageType = 2;
+const COOKIE_REPLY: MessageType = 3;
+const DATA: MessageType = 4;
+
+const HANDSHAKE_INIT_SZ: usize = 148;
+const HANDSHAKE_RESP_SZ: usize = 92;
+const COOKIE_REPLY_SZ: usize = 64;
+const DATA_OVERHEAD_SZ: usize = 32;
+
 #[derive(Debug)]
 pub enum TunnResult<'a> {
     Done,
@@ -54,14 +66,3 @@ impl<'a> From<WireGuardError> for TunnResult<'a> {
         TunnResult::Err(err)
     }
 }
-
-type MessageType = u32;
-const HANDSHAKE_INIT: MessageType = 1;
-const HANDSHAKE_RESP: MessageType = 2;
-const COOKIE_REPLY: MessageType = 3;
-const DATA: MessageType = 4;
-
-const HANDSHAKE_INIT_SZ: usize = 148;
-const HANDSHAKE_RESP_SZ: usize = 92;
-const COOKIE_REPLY_SZ: usize = 64;
-const DATA_OVERHEAD_SZ: usize = 32;

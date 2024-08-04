@@ -7,20 +7,12 @@ use std::{
 use parking_lot::{Mutex, RwLock};
 use x25519_dalek::{PublicKey, StaticSecret};
 
-use crate::{sleepyinstant::Instant, x25519};
-
 use super::{
-    handshake::{Cookies, Handshake, InitRecvState, InitSentState, NoiseParams, TimeStamper},
+    handshake::{Cookies, InitRecvState, InitSentState, NoiseParams, TimeStamper},
+    packet::Packet,
     session::Session,
-    Packet,
+    N_SESSIONS,
 };
-
-const NUM_SES: usize = 8;
-
-pub(crate) const LABEL_MAC1: &[u8; 8] = b"mac1----";
-pub(crate) const LABEL_COOKIE: &[u8; 8] = b"cookie--";
-const KEY_LEN: usize = 32;
-const TIMESTAMP_LEN: usize = 12;
 
 pub trait QueueIn {
     fn push(self, packet: Packet);
@@ -92,7 +84,7 @@ impl Node {
     ) {
         // need to ensure session
         let ses_id = self.active_session[conn.0].load(Ordering::Relaxed);
-        let state_id = conn.0 * NUM_SES + ses_id as usize;
+        let state_id = conn.0 * N_SESSIONS + ses_id as usize;
 
         {
             let state = self.states[state_id].read();
@@ -200,6 +192,7 @@ mod tests {
         }
     }
 
+    #[test]
     pub fn test_communication() {
         let msg = b"hello mister";
 

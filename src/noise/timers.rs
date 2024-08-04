@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: BSD-3-Clause
 
 use super::errors::WireGuardError;
-use crate::noise::{safe_duration::SafeDuration as Duration, Tunn, TunnResult};
+use crate::noise::{safe_duration::SafeDuration as Duration, TunnResult};
 use std::mem;
 use std::ops::{Index, IndexMut};
 use std::time::SystemTime;
@@ -126,6 +126,7 @@ impl IndexMut<TimerName> for Timers {
     }
 }
 
+#[cfg(never)]
 impl Tunn {
     pub(super) fn timer_tick(&mut self, timer_name: TimerName) {
         let time = self.timers[TimeCurrent];
