@@ -12,7 +12,7 @@ documentation = "https://docs.rs/boringtun/0.5.2/boringtun/"
 edition = "2021"
 
 [features]
-default = ["device"]
+default = []
 device = ["socket2", "thiserror"]
 jni-bindings = ["ffi-bindings", "jni"]
 ffi-bindings = ["tracing-subscriber"]

@@ -1,13 +1,14 @@
 // Copyright (c) 2019 Cloudflare, Inc. All rights reserved.
 // SPDX-License-Identifier: BSD-3-Clause
 
-pub mod dev;
 pub mod errors;
 pub mod handshake;
+pub mod node;
 pub mod packet;
 pub mod rate_limiter;
 pub mod safe_duration;
 pub mod session;
+#[cfg(never)]
 pub mod tun;
 
 #[cfg(test)]
