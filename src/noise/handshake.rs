@@ -369,19 +369,19 @@ impl NoiseParams {
         static_public: x25519::PublicKey,
         peer_static_public: x25519::PublicKey,
         preshared_key: Option<[u8; 32]>,
-    ) -> Result<NoiseParams, WireGuardError> {
+    ) -> NoiseParams {
         let static_shared = static_private.diffie_hellman(&peer_static_public);
 
         let initial_sending_mac_key = b2s_hash(LABEL_MAC1, peer_static_public.as_bytes());
 
-        Ok(NoiseParams {
+        NoiseParams {
             static_public,
             static_private,
             peer_static_public,
             static_shared,
             sending_mac1_key: initial_sending_mac_key,
             preshared_key,
-        })
+        }
     }
 
     /// Set a new private key
@@ -411,7 +411,7 @@ impl NoiseParams {
         // if dst.len() < super::HANDSHAKE_INIT_SZ {
         //     return Err(WireGuardError::DestinationBufferTooSmall);
         // }
-        let dst = packet.reset().set_head(super::HANDSHAKE_INIT_SZ).full();
+        let dst = packet.reset().set_data(super::HANDSHAKE_INIT_SZ).full();
 
         let (message_type, rest) = dst.split_at_mut(4);
         let (sender_index, rest) = rest.split_at_mut(4);

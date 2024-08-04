@@ -39,8 +39,8 @@ pub struct Node {
 
     stamper: TimeStamper,
 
-    connections: HashMap<PublicKey, ConnId>,
-    // Per connection data
+    links: HashMap<PublicKey, LinkId>,
+    // Per link data
     noise_params: Vec<NoiseParams>,
     cookies: Vec<Mutex<Cookies>>,
     active_session: Vec<AtomicU32>,
@@ -49,7 +49,7 @@ pub struct Node {
     states: Vec<RwLock<SessionState>>,
 
     // Per idx data
-    idx_to_state: RwLock<HashMap<u32, usize>>,
+    idx_to_state: RwLock<(u32, HashMap<u32, usize>)>,
 }
 
 impl Node {
@@ -60,27 +60,47 @@ impl Node {
 
             stamper: TimeStamper::new(),
 
-            connections: HashMap::new(),
+            links: HashMap::new(),
             noise_params: Vec::new(),
             cookies: Vec::new(),
             active_session: Vec::new(),
 
             states: Vec::new(),
 
-            idx_to_state: RwLock::new(HashMap::new()),
+            idx_to_state: RwLock::new((0, HashMap::new())),
         }
     }
 
-    pub fn add_conn(&mut self, config: Conn) -> ConnId {
-        todo!()
+    pub fn add_link(&mut self, config: Link) -> LinkId {
+        let slot = self.links.len();
+
+        let id = LinkId(slot);
+        if slot == self.links.len() {
+            self.noise_params.push(NoiseParams::new(
+                self.secret_key.clone(),
+                self.public_key,
+                config.public_key,
+                config.preshared_key,
+            ));
+            self.cookies.push(Mutex::new(Cookies::default()));
+            self.active_session.push(AtomicU32::new(0));
+
+            for _ in 0..N_SESSIONS {
+                self.states.push(RwLock::new(SessionState::None));
+            }
+        } else {
+            todo!("slots")
+        }
+        self.links.insert(config.public_key, id);
+        id
     }
 
     pub fn transport_one_plaintext(
         &self,
-        conn: ConnId,
+        conn: LinkId,
+        pool: impl QueueOut,
         tun_out: impl QueueOut,
         net_in: impl QueueIn,
-        pool: impl QueueOut,
     ) {
         // need to ensure session
         let ses_id = self.active_session[conn.0].load(Ordering::Relaxed);
@@ -112,14 +132,20 @@ impl Node {
                     return;
                 };
 
-                let mut cookies = self.cookies[conn.0].lock();
-                let index = self.next_idx();
-                self.noise_params[conn.0].format_handshake_initiation(
-                    index,
-                    &self.stamper,
-                    &mut cookies,
-                    &mut packet,
-                )
+                let index = self.activate(state_id);
+
+                let state = {
+                    let mut cookies = self.cookies[conn.0].lock();
+                    self.noise_params[conn.0].format_handshake_initiation(
+                        index,
+                        &self.stamper,
+                        &mut cookies,
+                        &mut packet,
+                    )
+                };
+                // TODO(pna): probably smarter to move after write lock is freed
+                net_in.push(packet);
+                state
             }
             _ => {
                 return;
@@ -127,11 +153,6 @@ impl Node {
         };
 
         *state = SessionState::InitSent(new_state);
-    }
-
-    fn next_idx(&self) -> u32 {
-        // This needs to find a next free index
-        todo!()
     }
 
     // pub fn transport_one_encrypted(
@@ -150,16 +171,30 @@ impl Node {
     //         Err(_) => return,
     //     }
     // }
+
+    fn activate(&self, state_id: usize) -> u32 {
+        // TODO: use a pseudo random generator
+        let mut next_and_map = self.idx_to_state.write();
+        // TODO: need some max iter count
+        while next_and_map.1.contains_key(&next_and_map.0) {
+            next_and_map.0 += 1;
+        }
+        let idx = next_and_map.0;
+        next_and_map.1.insert(idx, state_id);
+        next_and_map.0 += 1;
+        idx
+    }
 }
 
-pub struct ConnId(usize);
+#[derive(Copy, Clone)]
+pub struct LinkId(usize);
 
-pub struct Conn {
+pub struct Link {
     pub public_key: PublicKey,
     pub preshared_key: Option<[u8; 32]>,
 }
 
-impl Default for Conn {
+impl Default for Link {
     fn default() -> Self {
         Self {
             public_key: PublicKey::from([0u8; 32]),
@@ -199,11 +234,11 @@ mod tests {
         let mut node_a = Node::new(StaticSecret::random_from_rng(OsRng), None);
         let mut node_b = Node::new(StaticSecret::random_from_rng(OsRng), None);
 
-        let conn_ab = node_a.add_conn(Conn {
+        let conn_ab = node_a.add_link(Link {
             public_key: node_b.public_key,
             ..default()
         });
-        let conn_ba = node_b.add_conn(Conn {
+        let conn_ba = node_b.add_link(Link {
             public_key: node_a.public_key,
             ..default()
         });
@@ -221,7 +256,7 @@ mod tests {
 
         msg_a.push(packet);
 
-        node_a.transport_one_plaintext(conn_ab, &mut msg_a, &mut net, &mut pool);
+        node_a.transport_one_plaintext(conn_ab, &mut pool, &mut msg_a, &mut net);
         assert_eq!(net.len(), 1, "hanshake sent");
 
         // node_b.queue_encrypted(packet, &mut out_b, &mut net);
