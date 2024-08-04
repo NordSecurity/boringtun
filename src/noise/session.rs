@@ -3,6 +3,7 @@
 
 use super::{Packet, PacketData};
 use crate::noise::errors::WireGuardError;
+use nix::NixPath;
 use parking_lot::Mutex;
 use ring::aead::{Aad, LessSafeKey, Nonce, UnboundKey, CHACHA20_POLY1305};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -194,13 +195,25 @@ impl Session {
     /// dst - pre-allocated space to hold the encapsulating UDP packet to send over the network
     /// returns the size of the formatted packet
     pub(super) fn encrypt(&self, packet: &mut Packet) {
-        if packet.header().len() == super::DATA_OVERHEAD_SZ {
-            panic!("The destination buffer is too small");
-        }
+        // if packet.header().len() >= super::DATA_OVERHEAD_SZ {
+        //     panic!("The destination buffer is too small");
+        // }
 
         let sending_key_counter = self.sending_key_counter.fetch_add(1, Ordering::Relaxed) as u64;
 
-        let (message_type, rest) = packet.msg().split_at_mut(4);
+        /*
+        msg = packet_data {
+            u8 message_type // 1
+            u8 reserved_zero[3] // 3
+            u32 receiver_index // 4
+            u64 counter // 8
+            u8 encrypted_encapsulated_packet[]
+        }
+        */
+        let msg_len = packet.data().len();
+        let msg = packet.set_head(16).set_data(msg_len + AEAD_SIZE).full();
+
+        let (message_type, rest) = msg.split_at_mut(4);
         let (receiver_index, rest) = rest.split_at_mut(4);
         let (counter, data) = rest.split_at_mut(8);
 
@@ -209,24 +222,25 @@ impl Session {
         counter.copy_from_slice(&sending_key_counter.to_le_bytes());
 
         // TODO: spec requires padding to 16 bytes, but actually works fine without it
-        let n = {
-            let mut nonce = [0u8; 12];
-            nonce[4..12].copy_from_slice(&sending_key_counter.to_le_bytes());
-            // data[..src.len()].copy_from_slice(src);
-            self.sender
-                .seal_in_place_separate_tag(
-                    Nonce::assume_unique_for_key(nonce),
-                    Aad::from(&[]),
-                    &mut data[..],
-                )
-                .map(|tag| {
-                    data[src.len()..src.len() + AEAD_SIZE].copy_from_slice(tag.as_ref());
-                    src.len() + AEAD_SIZE
-                })
-                .unwrap()
-        };
+        // let n = {
+        let mut nonce = [0u8; 12];
+        // WTF: why is nonce not random
+        nonce[4..12].copy_from_slice(&sending_key_counter.to_le_bytes());
+        // data[..src.len()].copy_from_slice(src);
+        self.sender
+            .seal_in_place_separate_tag(
+                Nonce::assume_unique_for_key(nonce),
+                Aad::from(&[]),
+                &mut data[..msg_len],
+            )
+            .map(|tag| {
+                data[msg_len..].copy_from_slice(tag.as_ref());
+                // src.len() + AEAD_SIZE
+            })
+            .unwrap()
+        // };
 
-        &mut dst[..DATA_OFFSET + n]
+        // &mut dst[..DATA_OFFSET + n]
     }
 
     /// packet - a data packet we received from the network

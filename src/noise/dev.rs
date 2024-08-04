@@ -1,38 +1,63 @@
 use std::{
     collections::HashMap,
+    ops::{Deref, DerefMut},
     sync::atomic::{AtomicU32, Ordering},
 };
 
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 use x25519_dalek::{PublicKey, StaticSecret};
 
-use super::{handshake::Handshake, session::Session, Packet, Tunn};
+use crate::{sleepyinstant::Instant, x25519};
 
-pub trait QueueIn: Sync {
-    fn push(&self, packet: Packet);
+use super::{
+    handshake::{Cookies, Handshake, InitRecvState, InitSentState, NoiseParams, TimeStamper},
+    session::Session,
+    Packet,
+};
+
+const NUM_SES: usize = 8;
+
+pub(crate) const LABEL_MAC1: &[u8; 8] = b"mac1----";
+pub(crate) const LABEL_COOKIE: &[u8; 8] = b"cookie--";
+const KEY_LEN: usize = 32;
+const TIMESTAMP_LEN: usize = 12;
+
+pub trait QueueIn {
+    fn push(self, packet: Packet);
 }
 
-pub trait QueueOut: Sync {
-    fn pop(&self) -> Option<Packet>;
+pub trait QueueOut {
+    fn pop(self) -> Option<Packet>;
 }
 
 // pub trait QueueOut: Sync {
 
 // }
 
-//
+pub enum SessionState {
+    None,
+    InitSent(InitSentState),
+    InitRecv(InitRecvState),
+    Session(Session),
+}
+
 pub struct Node {
     pub public_key: PublicKey,
     secret_key: StaticSecret,
 
+    stamper: TimeStamper,
+
     connections: HashMap<PublicKey, ConnId>,
-
-    idx_to_handshake: HashMap<u32, ConnId>,
-    handshakes: Vec<RwLock<Handshake>>,
-
+    // Per connection data
+    noise_params: Vec<NoiseParams>,
+    cookies: Vec<Mutex<Cookies>>,
     active_session: Vec<AtomicU32>,
-    idx_to_session: HashMap<u32, usize>,
-    sessions: Vec<RwLock<Option<Session>>>,
+
+    // Per session data
+    states: Vec<RwLock<SessionState>>,
+
+    // Per idx data
+    idx_to_state: RwLock<HashMap<u32, usize>>,
 }
 
 impl Node {
@@ -41,13 +66,16 @@ impl Node {
             public_key: PublicKey::from(&ss),
             secret_key: ss,
 
+            stamper: TimeStamper::new(),
+
             connections: HashMap::new(),
+            noise_params: Vec::new(),
+            cookies: Vec::new(),
+            active_session: Vec::new(),
 
-            idx_to_handshake: HashMap::new(),
-            handshakes: Vec::new(),
+            states: Vec::new(),
 
-            idx_to_session: HashMap::new(),
-            sessions: Vec::new(),
+            idx_to_state: RwLock::new(HashMap::new()),
         }
     }
 
@@ -58,41 +86,78 @@ impl Node {
     pub fn transport_one_plaintext(
         &self,
         conn: ConnId,
-        tun_out: &impl QueueOut,
-        net_in: &impl QueueIn,
+        tun_out: impl QueueOut,
+        net_in: impl QueueIn,
+        pool: impl QueueOut,
     ) {
         // need to ensure session
         let ses_id = self.active_session[conn.0].load(Ordering::Relaxed);
+        let state_id = conn.0 * NUM_SES + ses_id as usize;
+
         {
-            let ses = self.sessions[conn.0 + ses_id as usize].read();
-            if let Some(ses) = ses.as_ref() {
-                if let Some(mut packet) = tun_out.pop() {
-                    ses.encrypt(&mut packet);
-                    net_in.push(packet)
+            let state = self.states[state_id].read();
+            match state.deref() {
+                SessionState::None => (),
+                SessionState::Session(ses) => {
+                    if let Some(mut packet) = tun_out.pop() {
+                        ses.encrypt(&mut packet);
+                        net_in.push(packet);
+                    }
+                    // Encrypted packet enqueued
+                    return;
+                }
+                _ => {
+                    return;
                 }
             }
         }
-        if let Some(ses) =  {
-            ses_id.
-        }
+
+        // No active init
+        let mut state = self.states[state_id].write();
+        let new_state = match state.deref_mut() {
+            &mut SessionState::None => {
+                let Some(mut packet) = pool.pop() else {
+                    return;
+                };
+
+                let mut cookies = self.cookies[conn.0].lock();
+                let index = self.next_idx();
+                self.noise_params[conn.0].format_handshake_initiation(
+                    index,
+                    &self.stamper,
+                    &mut cookies,
+                    &mut packet,
+                )
+            }
+            _ => {
+                return;
+            }
+        };
+
+        *state = SessionState::InitSent(new_state);
     }
 
-    pub fn transport_one_encrypted(
-        &self,
-        net_out: &impl QueueOut,
-        net_in: &impl QueueIn,
-        tun_in: &impl QueueIn,
-    ) {
-        match Tunn::parse_incoming_packet(&packet.0) {
-            Ok(packet) => match packet {
-                super::TaggedPacket::HandshakeInit(init) => {}
-                super::TaggedPacket::HandshakeResponse(_) => todo!(),
-                super::TaggedPacket::PacketCookieReply(_) => todo!(),
-                super::TaggedPacket::PacketData(_) => todo!(),
-            },
-            Err(_) => return,
-        }
+    fn next_idx(&self) -> u32 {
+        // This needs to find a next free index
+        todo!()
     }
+
+    // pub fn transport_one_encrypted(
+    //     &self,
+    //     net_out: &impl QueueOut,
+    //     net_in: &impl QueueIn,
+    //     tun_in: &impl QueueIn,
+    // ) {
+    //     match Tunn::parse_incoming_packet(&packet.0) {
+    //         Ok(packet) => match packet {
+    //             super::TaggedPacket::HandshakeInit(init) => {}
+    //             super::TaggedPacket::HandshakeResponse(_) => todo!(),
+    //             super::TaggedPacket::PacketCookieReply(_) => todo!(),
+    //             super::TaggedPacket::PacketData(_) => todo!(),
+    //         },
+    //         Err(_) => return,
+    //     }
+    // }
 }
 
 pub struct ConnId(usize);
@@ -117,27 +182,21 @@ pub fn default<T: Default>() -> T {
 
 #[cfg(test)]
 mod tests {
-
-    use crate::noise::Tunn;
+    use std::iter::repeat;
 
     use super::*;
-
-    use parking_lot::Mutex;
     use rand_core::OsRng;
     use x25519_dalek::StaticSecret;
 
-    #[derive(Default)]
-    struct BadQueue(Mutex<Vec<Packet>>);
-
-    impl QueueIn for BadQueue {
-        fn push(&self, packet: Packet) {
-            self.0.lock().push(packet);
+    impl QueueIn for &mut Vec<Packet> {
+        fn push(self, packet: Packet) {
+            self.push(packet);
         }
     }
 
-    impl QueueOut for BadQueue {
-        fn pop(&self) -> Option<Packet> {
-            self.0.lock().pop()
+    impl QueueOut for &mut Vec<Packet> {
+        fn pop(self) -> Option<Packet> {
+            self.pop()
         }
     }
 
@@ -156,26 +215,30 @@ mod tests {
             ..default()
         });
 
-        let msg_a = BadQueue::default();
-        let net_a = BadQueue::default();
-        node_a.queue_plaintext(conn_ab, packet, & net_a);
+        let mut pool = Vec::new();
+        pool.extend(repeat(Packet::new(80, 1420)).take(32));
 
-        let out_b = BadQueue::default();
-        let net_b = BadQueue::default();
+        let mut net = Vec::new();
 
-        {
-            let mut net = net_a.0.lock();
-            for packet in net.drain(..) {
-                node_b.queue_encrypted(packet, &out_b, &net_b);
-            }
-        }
+        let mut msg_a = Vec::new();
+        // let mut msg_b = Vec::new();
 
-        {
-            let mut net = net_b.0.lock();
-            for packet in net.drain(..) {
-                node_a.queue_encrypted(packet, &out_b, &net_a);
-            }
-        }
+        let mut packet = pool.pop().unwrap();
+        packet.write_data(msg);
+
+        msg_a.push(packet);
+
+        node_a.transport_one_plaintext(conn_ab, &mut msg_a, &mut net, &mut pool);
+        assert_eq!(net.len(), 1, "hanshake sent");
+
+        // node_b.queue_encrypted(packet, &mut out_b, &mut net);
+
+        // {
+        //     let mut net = net_b.0.lock();
+        //     for packet in net.drain(..) {
+        //         node_a.queue_encrypted(packet, &out_b, &net_a);
+        //     }
+        // }
 
         // let parsed = Tunn::parse_incoming_packet(packet);
 

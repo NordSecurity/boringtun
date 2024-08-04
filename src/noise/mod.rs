@@ -12,6 +12,9 @@ pub mod session;
 mod integration_tests;
 mod timers;
 
+use aead::Buffer;
+use nix::NixPath;
+
 use crate::noise::errors::WireGuardError;
 use crate::noise::handshake::Handshake;
 use crate::noise::rate_limiter::RateLimiter;
@@ -19,8 +22,10 @@ use crate::noise::session::message_data_len;
 use crate::noise::timers::{TimerName, Timers};
 use crate::x25519;
 
+use std::borrow::Borrow;
 use std::collections::VecDeque;
 use std::convert::{TryFrom, TryInto};
+use std::iter::repeat;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::Arc;
 use std::time::Duration;
@@ -91,27 +96,65 @@ const HANDSHAKE_RESP_SZ: usize = 92;
 const COOKIE_REPLY_SZ: usize = 64;
 const DATA_OVERHEAD_SZ: usize = 32;
 
+#[derive(Clone)]
 pub struct Packet {
-    /// Overhead bytes, not storring anything usefull
-    pub overhead: usize,
-    /// Offset to payload, offset - overhead is used for header
-    pub offset: usize,
-    /// Underlying buffer
-    pub buf: Vec<u8>,
+    /// max header len
+    head: usize,
+    buf: Box<[u8]>,
+
+    off: usize,
+    end: usize,
 }
 
 impl Packet {
-    /// Full message, header + payload
-    pub fn msg(&mut self) -> &mut [u8] {
-        &mut self.buf[self.overhead..]
+    pub fn new(overhead: usize, mtu: usize) -> Self {
+        let mut buf = Vec::with_capacity(mtu + overhead);
+        buf.extend(repeat(0).take(mtu + overhead));
+
+        Packet {
+            head: overhead,
+            off: overhead,
+            end: buf.len(),
+            buf: buf.into_boxed_slice(),
+        }
     }
 
-    pub fn header(&mut self) -> &mut [u8] {
-        &mut self.buf[self.overhead..self.offset]
+    pub fn write_data(&mut self, data: &[u8]) {
+        self.end = self.head + data.len();
+        self.buf[self.head..self.end].copy_from_slice(data);
     }
 
-    pub fn payload(&mut self) -> &mut [u8] {
-        &mut self.buf[self.offset..]
+    /// Reset packet to store max size packet
+    pub fn reset(&mut self) -> &mut Self {
+        self.off = self.head;
+        self.end = self.buf.len();
+        self
+    }
+
+    // Change the size of header
+    pub fn set_head(&mut self, len: usize) -> &mut Self {
+        self.off = self.head - len;
+        self
+    }
+
+    pub fn set_data(&mut self, len: usize) -> &mut Self {
+        self.end = self.head + len;
+        self
+    }
+
+    /// Return header and data
+    pub fn full(&mut self) -> &mut [u8] {
+        &mut self.buf[self.off..self.end]
+    }
+
+    /// Return just the header
+    pub fn head(&mut self) -> &mut [u8] {
+        &mut self.buf[self.off..self.head]
+    }
+
+    /// Return just the data
+    pub fn data(&mut self) -> &mut [u8] {
+        &mut self.buf[self.head..self.end]
     }
 }
 
