@@ -9,7 +9,7 @@ use x25519_dalek::{PublicKey, StaticSecret};
 
 use super::{
     handshake::{Cookies, InitRecvState, InitSentState, NoiseParams, TimeStamper},
-    packet::Packet,
+    packet::{parse_incoming_packet, Packet},
     session::Session,
     N_SESSIONS,
 };
@@ -95,16 +95,16 @@ impl Node {
         id
     }
 
-    pub fn transport_one_plaintext(
+    pub fn encode_one(
         &self,
-        conn: LinkId,
+        link: LinkId,
         pool: impl QueueOut,
         tun_out: impl QueueOut,
         net_in: impl QueueIn,
     ) {
         // need to ensure session
-        let ses_id = self.active_session[conn.0].load(Ordering::Relaxed);
-        let state_id = conn.0 * N_SESSIONS + ses_id as usize;
+        let ses_id = self.active_session[link.0].load(Ordering::Relaxed);
+        let state_id = link.0 * N_SESSIONS + ses_id as usize;
 
         {
             let state = self.states[state_id].read();
@@ -135,8 +135,8 @@ impl Node {
                 let index = self.activate(state_id);
 
                 let state = {
-                    let mut cookies = self.cookies[conn.0].lock();
-                    self.noise_params[conn.0].format_handshake_initiation(
+                    let mut cookies = self.cookies[link.0].lock();
+                    self.noise_params[link.0].format_handshake_initiation(
                         index,
                         &self.stamper,
                         &mut cookies,
@@ -155,22 +155,64 @@ impl Node {
         *state = SessionState::InitSent(new_state);
     }
 
-    // pub fn transport_one_encrypted(
-    //     &self,
-    //     net_out: &impl QueueOut,
-    //     net_in: &impl QueueIn,
-    //     tun_in: &impl QueueIn,
-    // ) {
-    //     match Tunn::parse_incoming_packet(&packet.0) {
-    //         Ok(packet) => match packet {
-    //             super::TaggedPacket::HandshakeInit(init) => {}
-    //             super::TaggedPacket::HandshakeResponse(_) => todo!(),
-    //             super::TaggedPacket::PacketCookieReply(_) => todo!(),
-    //             super::TaggedPacket::PacketData(_) => todo!(),
-    //         },
-    //         Err(_) => return,
-    //     }
-    // }
+    pub fn decode_one(
+        &self,
+        link: LinkId,
+        pool: impl QueueIn,
+        net_out: impl QueueOut,
+        net_in: impl QueueIn,
+        tun_in: impl QueueIn,
+    ) {
+        // match Tunn::parse_incoming_packet(&packet.0) {
+        //     Ok(packet) => match packet {
+        //         super::TaggedPacket::HandshakeInit(init) => {}
+        //         super::TaggedPacket::HandshakeResponse(_) => todo!(),
+        //         super::TaggedPacket::PacketCookieReply(_) => todo!(),
+        //         super::TaggedPacket::PacketData(_) => todo!(),
+        //     },
+        //     Err(_) => return,
+        // }
+        let Some(mut packet) = net_out.pop() else {
+            return;
+        };
+
+        match packet.tag() {
+            Ok(tagged) => match tagged {
+                super::packet::TaggedPacket::Init { packet } => {
+                    // let ses = self.active_session[link.0].load(Ordering::Release);
+                    // let state_id = link.0 * N_SESSIONS + ses;
+                    // self.states[state_id].read
+                }
+                super::packet::TaggedPacket::Reply { packet } => todo!(),
+                super::packet::TaggedPacket::Cookie { packet } => todo!(),
+                super::packet::TaggedPacket::Data { packet } => todo!(),
+            },
+            Err(packet) => {
+                // Return packet to pool
+                pool.push(packet);
+            }
+        }
+
+        // TODO: rate limiter should be used here
+        // let Ok(tagged) = parse_incoming_packet(packet.full()) else {
+        //     return;
+        // };
+
+        // enum Act { Init }
+        // let action = match tagged {
+        //     super::packet::TaggedPacket::HandshakeInit(init) => {
+        //         Act::Init
+        //     },
+        //     super::packet::TaggedPacket::HandshakeResponse(resp) => todo!(),
+        //     super::packet::TaggedPacket::PacketCookieReply(_) => todo!(),
+        //     super::packet::TaggedPacket::PacketData(data) => todo!(),
+        // }
+        // match action {
+        //     Act::Init => {
+        //         self.
+        //     },
+        // }
+    }
 
     fn activate(&self, state_id: usize) -> u32 {
         // TODO: use a pseudo random generator
@@ -256,7 +298,7 @@ mod tests {
 
         msg_a.push(packet);
 
-        node_a.transport_one_plaintext(conn_ab, &mut pool, &mut msg_a, &mut net);
+        node_a.encode_one(conn_ab, &mut pool, &mut msg_a, &mut net);
         assert_eq!(net.len(), 1, "hanshake sent");
 
         // node_b.queue_encrypted(packet, &mut out_b, &mut net);
