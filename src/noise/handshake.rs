@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: BSD-3-Clause
 
 use super::packet::{
-    HandshakeInit, HandshakeResponse, Init, Packet, PacketCookieReply, TaggedPacket,
+    HandshakeInit, HandshakeResponse, Init, Packet, PacketCookieReply, Reply, TaggedPacket,
 };
 use super::HANDSHAKE_RESP_SZ;
 use crate::noise::errors::WireGuardError;
@@ -654,6 +654,75 @@ impl NoiseParams {
         self.append_mac1_and_mac2(cookies, &mut dst[..super::HANDSHAKE_RESP_SZ]);
 
         Session::new(index, peer_index, temp2, temp3)
+    }
+
+    pub(super) fn receive_handshake_response(
+        &self,
+        state: InitSentState,
+        packet: &TaggedPacket<Reply>,
+    ) -> Result<Session, WireGuardError> {
+        // Check if there is a handshake awaiting a response and return the correct one
+        let peer_index = packet.sender_idx();
+        let local_index = state.local_index;
+
+        let unencrypted_ephemeral = x25519::PublicKey::from(*packet.unencrypted_ephemeral());
+        // msg.unencrypted_ephemeral = DH_PUBKEY(responder.ephemeral_private)
+        // responder.hash = HASH(responder.hash || msg.unencrypted_ephemeral)
+        let mut hash = b2s_hash(&state.hash, unencrypted_ephemeral.as_bytes());
+        // temp = HMAC(responder.chaining_key, msg.unencrypted_ephemeral)
+        let temp = b2s_hmac(&state.chaining_key, unencrypted_ephemeral.as_bytes());
+        // responder.chaining_key = HMAC(temp, 0x1)
+        let mut chaining_key = b2s_hmac(&temp, &[0x01]);
+        // temp = HMAC(responder.chaining_key, DH(responder.ephemeral_private, initiator.ephemeral_public))
+        let ephemeral_shared = state
+            .ephemeral_private
+            .diffie_hellman(&unencrypted_ephemeral);
+        let temp = b2s_hmac(&chaining_key, &ephemeral_shared.to_bytes());
+        // responder.chaining_key = HMAC(temp, 0x1)
+        chaining_key = b2s_hmac(&temp, &[0x01]);
+        // temp = HMAC(responder.chaining_key, DH(responder.ephemeral_private, initiator.static_public))
+        let temp = b2s_hmac(
+            &chaining_key,
+            &self
+                .static_private
+                .diffie_hellman(&unencrypted_ephemeral)
+                .to_bytes(),
+        );
+        // responder.chaining_key = HMAC(temp, 0x1)
+        chaining_key = b2s_hmac(&temp, &[0x01]);
+        // temp = HMAC(responder.chaining_key, preshared_key)
+        let temp = b2s_hmac(&chaining_key, &self.preshared_key.unwrap_or([0u8; 32])[..]);
+        // responder.chaining_key = HMAC(temp, 0x1)
+        chaining_key = b2s_hmac(&temp, &[0x01]);
+        // temp2 = HMAC(temp, responder.chaining_key || 0x2)
+        let temp2 = b2s_hmac2(&temp, &chaining_key, &[0x02]);
+        // key = HMAC(temp, temp2 || 0x3)
+        let key = b2s_hmac2(&temp, &temp2, &[0x03]);
+        // responder.hash = HASH(responder.hash || temp2)
+        hash = b2s_hash(&hash, &temp2);
+        // msg.encrypted_nothing = AEAD(key, 0, [empty], responder.hash)
+        aead_chacha20_open(&mut [], &key, 0, packet.encrypted_nothing(), &hash)?;
+
+        // responder.hash = HASH(responder.hash || msg.encrypted_nothing)
+        // hash = b2s_hash(hash, buf[ENC_NOTHING_OFF..ENC_NOTHING_OFF + ENC_NOTHING_SZ]);
+
+        // Derive keys
+        // temp1 = HMAC(initiator.chaining_key, [empty])
+        // temp2 = HMAC(temp1, 0x1)
+        // temp3 = HMAC(temp1, temp2 || 0x2)
+        // initiator.sending_key = temp2
+        // initiator.receiving_key = temp3
+        // initiator.sending_key_counter = 0
+        // initiator.receiving_key_counter = 0
+        let temp1 = b2s_hmac(&chaining_key, &[]);
+        let temp2 = b2s_hmac(&temp1, &[0x01]);
+        let temp3 = b2s_hmac2(&temp1, &temp2, &[0x02]);
+
+        // TODO(pna): bring back last_rtt
+        // let rtt_time = Instant::now().duration_since(state.time_sent);
+        // self.last_rtt = Some(rtt_time.as_millis() as u32);
+
+        Ok(Session::new(local_index, peer_index, temp3, temp2))
     }
 
     // Compute and append mac1 and mac2 to a handshake message
