@@ -1,4 +1,4 @@
-use std::{iter::repeat, marker::PhantomData};
+use std::{iter::repeat, marker::PhantomData, ops::DerefMut};
 
 use super::{
     errors::WireGuardError, COOKIE_REPLY, COOKIE_REPLY_SZ, DATA, DATA_OVERHEAD_SZ, HANDSHAKE_INIT,
@@ -7,11 +7,12 @@ use super::{
 
 #[derive(Clone, Debug)]
 pub struct Packet {
-    /// max header len
-    head: usize,
+    /// max header len, maybe can be moved to const
+    org_head: usize,
     buf: Box<[u8]>,
 
     off: usize,
+    head: usize,
     end: usize,
 }
 
@@ -21,6 +22,7 @@ impl Packet {
         buf.extend(repeat(0).take(mtu + overhead));
 
         Packet {
+            org_head: overhead,
             head: overhead,
             off: overhead,
             end: buf.len(),
@@ -35,6 +37,7 @@ impl Packet {
 
     /// Reset packet to store max size packet
     pub fn reset(&mut self) -> &mut Self {
+        self.head = self.org_head;
         self.off = self.head;
         self.end = self.buf.len();
         self
@@ -103,10 +106,17 @@ pub struct TaggedPacket<Tag> {
     _tag: PhantomData<Tag>,
 }
 
-impl<T> TaggedPacket<T> {
+pub trait PacketTag {
+    /// Allows special ajjustments for tags
+    fn ajust(packet: Packet) -> Packet {
+        packet
+    }
+}
+
+impl<T: PacketTag> TaggedPacket<T> {
     fn new(packet: Packet) -> Self {
         Self {
-            packet,
+            packet: T::ajust(packet),
             _tag: PhantomData,
         }
     }
@@ -134,6 +144,8 @@ pub enum AnyPacket {
 
 #[derive(Debug)]
 pub struct Init;
+impl PacketTag for Init {}
+
 impl TaggedPacket<Init> {
     pub fn sender_idx(&self) -> u32 {
         u32::from_le_bytes(self.data()[4..8].try_into().unwrap())
@@ -160,6 +172,8 @@ pub struct HandshakeInit<'a> {
 
 #[derive(Debug)]
 pub struct Reply;
+impl PacketTag for Reply {}
+
 impl TaggedPacket<Reply> {
     pub fn sender_idx(&self) -> u32 {
         u32::from_le_bytes(self.data()[4..8].try_into().unwrap())
@@ -186,6 +200,8 @@ pub struct HandshakeResponse<'a> {
 
 #[derive(Debug)]
 pub struct Cookie;
+impl PacketTag for Cookie {}
+
 impl TaggedPacket<Cookie> {
     pub fn receiver_idx(&self) -> u32 {
         u32::from_le_bytes(self.data()[4..8].try_into().unwrap())
@@ -207,15 +223,29 @@ pub struct PacketCookieReply<'a> {
 
 #[derive(Debug)]
 pub struct Data;
+impl PacketTag for Data {
+    fn ajust(mut packet: Packet) -> Packet {
+        // TODO: unify this shananigans
+        packet.head += 16;
+        packet
+    }
+}
+
+impl DerefMut for TaggedPacket<Data> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.packet
+    }
+}
+
 impl TaggedPacket<Data> {
     pub fn receiver_idx(&self) -> u32 {
-        u32::from_le_bytes(self.data()[4..8].try_into().unwrap())
+        u32::from_le_bytes(self.head()[4..8].try_into().unwrap())
     }
     pub fn counter(&self) -> u64 {
-        u64::from_le_bytes(self.data()[8..16].try_into().unwrap())
+        u64::from_le_bytes(self.head()[8..16].try_into().unwrap())
     }
-    pub fn encrypted_encapsulated_packet(&self) -> &[u8] {
-        &self.data()[16..]
+    pub fn encrypted_encapsulated_packet(&mut self) -> &mut [u8] {
+        self.packet.data_mut()
     }
 }
 

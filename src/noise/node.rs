@@ -8,7 +8,7 @@ use parking_lot::{Mutex, RwLock};
 use x25519_dalek::{PublicKey, StaticSecret};
 
 use super::{
-    handshake::{Cookies, InitRecvState, InitSentState, NoiseParams, TimeStamper},
+    handshake::{Cookies, InitRecvState, InitSentState, NoiseParams, Tai64N, TimeStamper},
     packet::{parse_incoming_packet, Packet},
     session::Session,
     N_SESSIONS,
@@ -26,7 +26,7 @@ pub enum SessionState {
     None,
     InitSent(InitSentState),
     InitRecv(InitRecvState),
-    Session(Session),
+    Active(Session),
 }
 
 pub struct Node {
@@ -39,6 +39,7 @@ pub struct Node {
     // Per link data
     noise_params: Vec<NoiseParams>,
     cookies: Vec<Mutex<Cookies>>,
+    last_handshake: Vec<Mutex<Tai64N>>,
     // link -> active session
     active: Vec<AtomicU32>,
     // Maybe smarter to use a lock free set
@@ -83,6 +84,7 @@ impl Node {
                 config.preshared_key,
             ));
             self.cookies.push(Mutex::new(Cookies::default()));
+            self.last_handshake.push(Mutex::new(Tai64N::zero()));
             self.active.push(AtomicU32::new(0));
             self.busy.push(Mutex::new(0));
 
@@ -152,7 +154,7 @@ impl Node {
             let state = self.states[state_id].read();
             match state.deref() {
                 SessionState::None => {}
-                SessionState::Session(ses) => {
+                SessionState::Active(ses) => {
                     if let Some(mut packet) = msg_input.pop() {
                         ses.encrypt(&mut packet);
                         net_output.push(packet);
@@ -182,21 +184,65 @@ impl Node {
 
         match packet.tag() {
             Ok(tagged) => match tagged {
-                super::packet::AnyPacket::Init { mut packet } => {
+                super::packet::AnyPacket::Init(mut packet) => {
+                    let recv_state = {
+                        let mut last_handshake = self.last_handshake[link.0].lock();
+                        match self.noise_params[link.0]
+                            .receive_handshake_initiation(&mut last_handshake, &packet)
+                        {
+                            Ok(state) => state,
+                            Err(_) => {
+                                pool.push(packet.into_packet());
+                                return;
+                            }
+                        }
+                    };
+
+                    let mut packet = packet.into_packet();
                     let Some(index) = self.alloc_state(link) else {
                         return;
                     };
                     let state_id = link.0 * N_SESSIONS + index;
-
-                    self.noise_params[link.0].handle_handshake_init(&mut packet);
-
-                    // let ses = self.active_session[link.0].load(Ordering::Release);
-                    // let state_id = link.0 * N_SESSIONS + ses;
-                    // self.states[state_id].read
+                    {
+                        let mut state = self.states[state_id].write();
+                        let mut cookies = self.cookies[link.0].lock();
+                        let local_index = self.activate(state_id);
+                        *state = SessionState::Active(
+                            self.noise_params[link.0].format_handshake_response(
+                                recv_state,
+                                local_index,
+                                &mut cookies,
+                                &mut packet,
+                            ),
+                        )
+                    }
                 }
-                super::packet::AnyPacket::Reply { packet } => todo!(),
-                super::packet::AnyPacket::Cookie { packet } => todo!(),
-                super::packet::AnyPacket::Data { packet } => todo!(),
+                super::packet::AnyPacket::Reply(mut packet) => todo!(),
+                super::packet::AnyPacket::Cookie(mut packet) => todo!(),
+                super::packet::AnyPacket::Data(mut packet) => {
+                    let Some((idx, state_id)) = self
+                        .idx_to_state
+                        .read()
+                        .1
+                        .get_key_value(&packet.receiver_idx())
+                        .map(|(k, v)| (*k, *v))
+                        .clone()
+                    else {
+                        return;
+                    };
+                    debug_assert!(state_id / N_SESSIONS == link.0);
+
+                    // TODO(pna): this will need to be generational
+                    match self.states[state_id].read().deref() {
+                        SessionState::Active(ses) => {
+                            ses.decrypt(&mut packet);
+                            tun_in.push(packet.into_packet());
+                        }
+                        _ => {
+                            pool.push(packet.into_packet());
+                        }
+                    }
+                }
             },
             Err(packet) => {
                 // Return packet to pool

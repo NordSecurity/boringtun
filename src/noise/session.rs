@@ -1,7 +1,7 @@
 // Copyright (c) 2019 Cloudflare, Inc. All rights reserved.
 // SPDX-License-Identifier: BSD-3-Clause
 
-use super::packet::{Packet, PacketData};
+use super::packet::{Data, Packet, PacketData, TaggedPacket};
 use crate::noise::errors::WireGuardError;
 use parking_lot::Mutex;
 use ring::aead::{Aad, LessSafeKey, Nonce, UnboundKey, CHACHA20_POLY1305};
@@ -246,38 +246,41 @@ impl Session {
     /// dst - pre-allocated space to hold the encapsulated IP packet, to send to the interface
     ///       dst will always take less space than src
     /// return the size of the encapsulated packet on success
-    pub(super) fn receive_packet_data<'a>(
+    pub fn decrypt<'a>(
         &self,
-        packet: PacketData,
-        dst: &'a mut [u8],
-    ) -> Result<&'a mut [u8], WireGuardError> {
-        let ct_len = packet.encrypted_encapsulated_packet.len();
-        if dst.len() < ct_len {
-            // This is a very incorrect use of the library, therefore panic and not error
-            panic!("The destination buffer is too small");
-        }
-        if packet.receiver_idx != self.receiving_index {
-            return Err(WireGuardError::WrongIndex);
-        }
+        // packet: PacketData,
+        // dst: &'a mut [u8],
+        packet: &mut TaggedPacket<Data>,
+    ) -> Result<(), WireGuardError> {
+        // let ct_len = packet.encrypted_encapsulated_packet().len();
+        // if dst.len() < ct_len {
+        //     // This is a very incorrect use of the library, therefore panic and not error
+        //     panic!("The destination buffer is too small");
+        // }
+        // if packet.receiver_idx != self.receiving_index {
+        //     return Err(WireGuardError::WrongIndex);
+        // }
         // Don't reuse counters, in case this is a replay attack we want to quickly check the counter without running expensive decryption
-        self.receiving_counter_quick_check(packet.counter)?;
-
-        let ret = {
+        self.receiving_counter_quick_check(packet.counter())?;
+        // let dst = packet.encrypted_encapsulated_packet();
+        let len = {
             let mut nonce = [0u8; 12];
-            nonce[4..12].copy_from_slice(&packet.counter.to_le_bytes());
-            dst[..ct_len].copy_from_slice(packet.encrypted_encapsulated_packet);
+            nonce[4..12].copy_from_slice(&packet.counter().to_le_bytes());
+            // dst[..ct_len].copy_from_slice(packet.encrypted_encapsulated_packet);
             self.receiver
                 .open_in_place(
                     Nonce::assume_unique_for_key(nonce),
                     Aad::from(&[]),
-                    &mut dst[..ct_len],
+                    packet.data_mut(),
                 )
                 .map_err(|_| WireGuardError::InvalidAeadTag)?
+                .len()
         };
+        packet.set_data(len);
 
         // After decryption is done, check counter again, and mark as received
-        self.receiving_counter_mark(packet.counter)?;
-        Ok(ret)
+        self.receiving_counter_mark(packet.counter())?;
+        Ok(())
     }
 
     /// Returns the estimated downstream packet loss for this session
