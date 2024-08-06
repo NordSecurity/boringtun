@@ -1,11 +1,11 @@
-use std::iter::repeat;
+use std::{iter::repeat, marker::PhantomData};
 
 use super::{
     errors::WireGuardError, COOKIE_REPLY, COOKIE_REPLY_SZ, DATA, DATA_OVERHEAD_SZ, HANDSHAKE_INIT,
     HANDSHAKE_INIT_SZ, HANDSHAKE_RESP, HANDSHAKE_RESP_SZ,
 };
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct Packet {
     /// max header len
     head: usize,
@@ -52,65 +52,102 @@ impl Packet {
     }
 
     /// Return header and data
-    pub fn full(&mut self) -> &mut [u8] {
+    pub fn full(&self) -> &[u8] {
+        &self.buf[self.off..self.end]
+    }
+
+    /// Return header and data
+    pub fn full_mut(&mut self) -> &mut [u8] {
         &mut self.buf[self.off..self.end]
     }
 
     /// Return just the header
-    pub fn head(&mut self) -> &mut [u8] {
+    pub fn head(&self) -> &[u8] {
+        &self.buf[self.off..self.head]
+    }
+
+    /// Return just the header
+    pub fn head_mut(&mut self) -> &mut [u8] {
         &mut self.buf[self.off..self.head]
     }
 
     /// Return just the data
-    pub fn data(&mut self) -> &mut [u8] {
+    pub fn data(&self) -> &[u8] {
+        &self.buf[self.head..self.end]
+    }
+
+    /// Return just the data
+    pub fn data_mut(&mut self) -> &mut [u8] {
         &mut self.buf[self.head..self.end]
     }
 }
 
 impl Packet {
-    pub fn tag(mut self) -> Result<TaggedPacket, Packet> {
+    pub fn tag(self) -> Result<AnyPacket, Packet> {
         let packet_type = u32::from_le_bytes(self.data()[0..4].try_into().unwrap());
 
         let tagged = match (packet_type, self.data().len()) {
-            (HANDSHAKE_INIT, HANDSHAKE_INIT_SZ) => TaggedPacket::Init {
-                // sender_idx: u32::from_le_bytes(src[4..8].try_into().unwrap()),
-                // unencrypted_ephemeral: <&[u8; 32] as TryFrom<&[u8]>>::try_from(&src[8..40])
-                // .expect("length already checked above"),
-                // encrypted_static: &src[40..88],
-                // encrypted_timestamp: &src[88..116],
-                packet: self,
-            },
-            (HANDSHAKE_RESP, HANDSHAKE_RESP_SZ) => TaggedPacket::Reply {
-                // sender_idx: u32::from_le_bytes(src[4..8].try_into().unwrap()),
-                // receiver_idx: u32::from_le_bytes(src[8..12].try_into().unwrap()),
-                // unencrypted_ephemeral: <&[u8; 32] as TryFrom<&[u8]>>::try_from(&src[12..44])
-                //     .expect("length already checked above"),
-                // encrypted_nothing: &src[44..60],
-                packet: self,
-            },
-            (COOKIE_REPLY, COOKIE_REPLY_SZ) => TaggedPacket::Cookie {
-                // receiver_idx: u32::from_le_bytes(src[4..8].try_into().unwrap()),
-                // nonce: &src[8..32],
-                // encrypted_cookie: &src[32..64],
-                packet: self,
-            },
-            (DATA, DATA_OVERHEAD_SZ..=std::usize::MAX) => TaggedPacket::Data {
-                // receiver_idx: u32::from_le_bytes(src[4..8].try_into().unwrap()),
-                // counter: u64::from_le_bytes(src[8..16].try_into().unwrap()),
-                // encrypted_encapsulated_packet: &src[16..],
-                packet: self,
-            },
+            (HANDSHAKE_INIT, HANDSHAKE_INIT_SZ) => AnyPacket::Init(TaggedPacket::new(self)),
+            (HANDSHAKE_RESP, HANDSHAKE_RESP_SZ) => AnyPacket::Reply(TaggedPacket::new(self)),
+            (COOKIE_REPLY, COOKIE_REPLY_SZ) => AnyPacket::Cookie(TaggedPacket::new(self)),
+            (DATA, DATA_OVERHEAD_SZ..=std::usize::MAX) => AnyPacket::Data(TaggedPacket::new(self)),
             _ => return Err(self),
         };
         Ok(tagged)
     }
 }
 
-pub enum TaggedPacket {
-    Init { packet: Packet },
-    Reply { packet: Packet },
-    Cookie { packet: Packet },
-    Data { packet: Packet },
+#[derive(Debug)]
+pub struct TaggedPacket<Tag> {
+    packet: Packet,
+    _tag: PhantomData<Tag>,
+}
+
+impl<T> TaggedPacket<T> {
+    fn new(packet: Packet) -> Self {
+        Self {
+            packet,
+            _tag: PhantomData,
+        }
+    }
+
+    pub fn into_packet(self) -> Packet {
+        self.packet
+    }
+}
+
+impl<T> std::ops::Deref for TaggedPacket<T> {
+    type Target = Packet;
+
+    fn deref(&self) -> &Self::Target {
+        &self.packet
+    }
+}
+
+#[derive(Debug)]
+pub enum AnyPacket {
+    Init(TaggedPacket<Init>),
+    Reply(TaggedPacket<Reply>),
+    Cookie(TaggedPacket<Cookie>),
+    Data(TaggedPacket<Data>),
+}
+
+#[derive(Debug)]
+pub struct Init;
+impl TaggedPacket<Init> {
+    pub fn sender_idx(&self) -> u32 {
+        u32::from_le_bytes(self.data()[4..8].try_into().unwrap())
+    }
+    pub fn unencrypted_ephemeral(&self) -> &[u8; 32] {
+        <&[u8; 32] as TryFrom<&[u8]>>::try_from(&self.data()[8..40])
+            .expect("length already checked above")
+    }
+    pub fn encrypted_static(&self) -> &[u8] {
+        &self.data()[40..88]
+    }
+    pub fn encrypted_timestamp(&self) -> &[u8] {
+        &self.data()[88..116]
+    }
 }
 
 #[derive(Debug)]
@@ -122,6 +159,24 @@ pub struct HandshakeInit<'a> {
 }
 
 #[derive(Debug)]
+pub struct Reply;
+impl TaggedPacket<Reply> {
+    pub fn sender_idx(&self) -> u32 {
+        u32::from_le_bytes(self.data()[4..8].try_into().unwrap())
+    }
+    pub fn receiver_idx(&self) -> u32 {
+        u32::from_le_bytes(self.data()[8..12].try_into().unwrap())
+    }
+    pub fn unencrypted_ephemeral(&self) -> &[u8; 32] {
+        <&[u8; 32] as TryFrom<&[u8]>>::try_from(&self.data()[12..44])
+            .expect("length already checked above")
+    }
+    pub fn encrypted_nothing(&self) -> &[u8] {
+        &self.data()[44..60]
+    }
+}
+
+#[derive(Debug)]
 pub struct HandshakeResponse<'a> {
     pub sender_idx: u32,
     pub receiver_idx: u32,
@@ -130,10 +185,38 @@ pub struct HandshakeResponse<'a> {
 }
 
 #[derive(Debug)]
+pub struct Cookie;
+impl TaggedPacket<Cookie> {
+    pub fn receiver_idx(&self) -> u32 {
+        u32::from_le_bytes(self.data()[4..8].try_into().unwrap())
+    }
+    pub fn nonce(&self) -> &[u8] {
+        &self.data()[8..32]
+    }
+    pub fn encrypted_cookie(&self) -> &[u8] {
+        &self.data()[32..64]
+    }
+}
+
+#[derive(Debug)]
 pub struct PacketCookieReply<'a> {
     pub receiver_idx: u32,
     pub nonce: &'a [u8],
     pub encrypted_cookie: &'a [u8],
+}
+
+#[derive(Debug)]
+pub struct Data;
+impl TaggedPacket<Data> {
+    pub fn receiver_idx(&self) -> u32 {
+        u32::from_le_bytes(self.data()[4..8].try_into().unwrap())
+    }
+    pub fn counter(&self) -> u64 {
+        u64::from_le_bytes(self.data()[8..16].try_into().unwrap())
+    }
+    pub fn encrypted_encapsulated_packet(&self) -> &[u8] {
+        &self.data()[16..]
+    }
 }
 
 #[derive(Debug)]

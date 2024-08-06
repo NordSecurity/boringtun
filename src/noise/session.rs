@@ -209,8 +209,8 @@ impl Session {
             u8 encrypted_encapsulated_packet[]
         }
         */
-        let msg_len = packet.data().len();
-        let msg = packet.set_head(16).set_data(msg_len + AEAD_SIZE).full();
+        let msg_len = packet.data_mut().len();
+        let msg = packet.set_head(16).set_data(msg_len + AEAD_SIZE).full_mut();
 
         let (message_type, rest) = msg.split_at_mut(4);
         let (receiver_index, rest) = rest.split_at_mut(4);

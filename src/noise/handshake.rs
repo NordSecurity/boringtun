@@ -411,7 +411,7 @@ impl NoiseParams {
         // if dst.len() < super::HANDSHAKE_INIT_SZ {
         //     return Err(WireGuardError::DestinationBufferTooSmall);
         // }
-        let dst = packet.reset().set_data(super::HANDSHAKE_INIT_SZ).full();
+        let dst = packet.reset().set_data(super::HANDSHAKE_INIT_SZ).full_mut();
 
         let (message_type, rest) = dst.split_at_mut(4);
         let (sender_index, rest) = rest.split_at_mut(4);
@@ -480,6 +480,86 @@ impl NoiseParams {
             ephemeral_private,
             time_sent: time_now,
         }
+    }
+
+    pub fn receive_handshake_init(
+        &self,
+        packet: &mut PacketWithTag<Init>,
+    ) -> Result<InitRecvState, WireGuardError> {
+        // initiator.chaining_key = HASH(CONSTRUCTION)
+        let mut chaining_key = INITIAL_CHAIN_KEY;
+        // initiator.hash = HASH(HASH(initiator.chaining_key || IDENTIFIER) || responder.static_public)
+        let mut hash = INITIAL_CHAIN_HASH;
+        hash = b2s_hash(&hash, self.static_public.as_bytes());
+        // msg.sender_index = little_endian(initiator.sender_index)
+        let peer_index = packet.sender_idx;
+        // msg.unencrypted_ephemeral = DH_PUBKEY(initiator.ephemeral_private)
+        let peer_ephemeral_public = x25519::PublicKey::from(*packet.unencrypted_ephemeral);
+        // initiator.hash = HASH(initiator.hash || msg.unencrypted_ephemeral)
+        hash = b2s_hash(&hash, peer_ephemeral_public.as_bytes());
+        // temp = HMAC(initiator.chaining_key, msg.unencrypted_ephemeral)
+        // initiator.chaining_key = HMAC(temp, 0x1)
+        chaining_key = b2s_hmac(
+            &b2s_hmac(&chaining_key, peer_ephemeral_public.as_bytes()),
+            &[0x01],
+        );
+        // temp = HMAC(initiator.chaining_key, DH(initiator.ephemeral_private, responder.static_public))
+        let ephemeral_shared = self.static_private.diffie_hellman(&peer_ephemeral_public);
+        let temp = b2s_hmac(&chaining_key, &ephemeral_shared.to_bytes());
+        // initiator.chaining_key = HMAC(temp, 0x1)
+        chaining_key = b2s_hmac(&temp, &[0x01]);
+        // key = HMAC(temp, initiator.chaining_key || 0x2)
+        let key = b2s_hmac2(&temp, &chaining_key, &[0x02]);
+
+        let mut peer_static_public_decrypted = [0u8; KEY_LEN];
+        // msg.encrypted_static = AEAD(key, 0, initiator.static_public, initiator.hash)
+        aead_chacha20_open(
+            &mut peer_static_public_decrypted,
+            &key,
+            0,
+            packet.encrypted_static,
+            &hash,
+        )?;
+
+        ring::constant_time::verify_slices_are_equal(
+            self.peer_static_public.as_bytes(),
+            &peer_static_public_decrypted,
+        )
+        .map_err(|_| WireGuardError::WrongKey)?;
+
+        // initiator.hash = HASH(initiator.hash || msg.encrypted_static)
+        hash = b2s_hash(&hash, packet.encrypted_static);
+        // temp = HMAC(initiator.chaining_key, DH(initiator.static_private, responder.static_public))
+        let temp = b2s_hmac(&chaining_key, self.params.static_shared.as_bytes());
+        // initiator.chaining_key = HMAC(temp, 0x1)
+        chaining_key = b2s_hmac(&temp, &[0x01]);
+        // key = HMAC(temp, initiator.chaining_key || 0x2)
+        let key = b2s_hmac2(&temp, &chaining_key, &[0x02]);
+        // msg.encrypted_timestamp = AEAD(key, 0, TAI64N(), initiator.hash)
+        let mut timestamp = [0u8; TIMESTAMP_LEN];
+        aead_chacha20_open(&mut timestamp, &key, 0, packet.encrypted_timestamp, &hash)?;
+
+        let timestamp = Tai64N::parse(&timestamp)?;
+        if !timestamp.after(&self.last_handshake_timestamp) {
+            // Possibly a replay
+            return Err(WireGuardError::WrongTai64nTimestamp);
+        }
+        self.last_handshake_timestamp = timestamp;
+
+        // initiator.hash = HASH(initiator.hash || msg.encrypted_timestamp)
+        hash = b2s_hash(&hash, packet.encrypted_timestamp);
+
+        self.previous = std::mem::replace(
+            &mut self.state,
+            HandshakeState::InitReceived {
+                chaining_key,
+                hash,
+                peer_ephemeral_public,
+                peer_index,
+            },
+        );
+
+        self.format_handshake_response(dst)
     }
 
     // Compute and append mac1 and mac2 to a handshake message
@@ -579,90 +659,6 @@ impl Handshake {
 
     pub(crate) fn set_preshared_key(&mut self, preshared_key: Option<[u8; 32]>) {
         self.params.preshared_key = preshared_key;
-    }
-
-    pub(super) fn receive_handshake_initialization<'a>(
-        &mut self,
-        packet: HandshakeInit,
-        dst: &'a mut [u8],
-    ) -> Result<(&'a mut [u8], Session), WireGuardError> {
-        // initiator.chaining_key = HASH(CONSTRUCTION)
-        let mut chaining_key = INITIAL_CHAIN_KEY;
-        // initiator.hash = HASH(HASH(initiator.chaining_key || IDENTIFIER) || responder.static_public)
-        let mut hash = INITIAL_CHAIN_HASH;
-        hash = b2s_hash(&hash, self.params.static_public.as_bytes());
-        // msg.sender_index = little_endian(initiator.sender_index)
-        let peer_index = packet.sender_idx;
-        // msg.unencrypted_ephemeral = DH_PUBKEY(initiator.ephemeral_private)
-        let peer_ephemeral_public = x25519::PublicKey::from(*packet.unencrypted_ephemeral);
-        // initiator.hash = HASH(initiator.hash || msg.unencrypted_ephemeral)
-        hash = b2s_hash(&hash, peer_ephemeral_public.as_bytes());
-        // temp = HMAC(initiator.chaining_key, msg.unencrypted_ephemeral)
-        // initiator.chaining_key = HMAC(temp, 0x1)
-        chaining_key = b2s_hmac(
-            &b2s_hmac(&chaining_key, peer_ephemeral_public.as_bytes()),
-            &[0x01],
-        );
-        // temp = HMAC(initiator.chaining_key, DH(initiator.ephemeral_private, responder.static_public))
-        let ephemeral_shared = self
-            .params
-            .static_private
-            .diffie_hellman(&peer_ephemeral_public);
-        let temp = b2s_hmac(&chaining_key, &ephemeral_shared.to_bytes());
-        // initiator.chaining_key = HMAC(temp, 0x1)
-        chaining_key = b2s_hmac(&temp, &[0x01]);
-        // key = HMAC(temp, initiator.chaining_key || 0x2)
-        let key = b2s_hmac2(&temp, &chaining_key, &[0x02]);
-
-        let mut peer_static_public_decrypted = [0u8; KEY_LEN];
-        // msg.encrypted_static = AEAD(key, 0, initiator.static_public, initiator.hash)
-        aead_chacha20_open(
-            &mut peer_static_public_decrypted,
-            &key,
-            0,
-            packet.encrypted_static,
-            &hash,
-        )?;
-
-        ring::constant_time::verify_slices_are_equal(
-            self.params.peer_static_public.as_bytes(),
-            &peer_static_public_decrypted,
-        )
-        .map_err(|_| WireGuardError::WrongKey)?;
-
-        // initiator.hash = HASH(initiator.hash || msg.encrypted_static)
-        hash = b2s_hash(&hash, packet.encrypted_static);
-        // temp = HMAC(initiator.chaining_key, DH(initiator.static_private, responder.static_public))
-        let temp = b2s_hmac(&chaining_key, self.params.static_shared.as_bytes());
-        // initiator.chaining_key = HMAC(temp, 0x1)
-        chaining_key = b2s_hmac(&temp, &[0x01]);
-        // key = HMAC(temp, initiator.chaining_key || 0x2)
-        let key = b2s_hmac2(&temp, &chaining_key, &[0x02]);
-        // msg.encrypted_timestamp = AEAD(key, 0, TAI64N(), initiator.hash)
-        let mut timestamp = [0u8; TIMESTAMP_LEN];
-        aead_chacha20_open(&mut timestamp, &key, 0, packet.encrypted_timestamp, &hash)?;
-
-        let timestamp = Tai64N::parse(&timestamp)?;
-        if !timestamp.after(&self.last_handshake_timestamp) {
-            // Possibly a replay
-            return Err(WireGuardError::WrongTai64nTimestamp);
-        }
-        self.last_handshake_timestamp = timestamp;
-
-        // initiator.hash = HASH(initiator.hash || msg.encrypted_timestamp)
-        hash = b2s_hash(&hash, packet.encrypted_timestamp);
-
-        self.previous = std::mem::replace(
-            &mut self.state,
-            HandshakeState::InitReceived {
-                chaining_key,
-                hash,
-                peer_ephemeral_public,
-                peer_index,
-            },
-        );
-
-        self.format_handshake_response(dst)
     }
 
     pub(super) fn receive_handshake_response(
