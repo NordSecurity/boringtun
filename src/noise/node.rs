@@ -5,6 +5,7 @@ use std::{
 };
 
 use parking_lot::{Mutex, RwLock};
+use tracing::{debug, info_span, trace, trace_span, warn, Span};
 use x25519_dalek::{PublicKey, StaticSecret};
 
 use super::{
@@ -49,13 +50,20 @@ pub struct Node {
 
     // Per idx data
     idx_to_state: RwLock<(u32, HashMap<u32, usize>)>,
+
+    span: Span,
 }
 
 impl Node {
-    pub fn new(ss: StaticSecret, psk: Option<StaticSecret>) -> Self {
+    pub fn new(ss: StaticSecret) -> Self {
+        let public_key = PublicKey::from(&ss);
+        let mut pk = base64::encode(public_key);
+        let _ = pk.split_off(4);
+        let span = info_span!("node", pk = pk);
+
         Self {
-            public_key: PublicKey::from(&ss),
             secret_key: ss,
+            public_key,
 
             stamper: TimeStamper::new(),
 
@@ -69,10 +77,14 @@ impl Node {
             states: Vec::new(),
 
             idx_to_state: RwLock::new((0, HashMap::new())),
+
+            span,
         }
     }
 
     pub fn add_link(&mut self, config: Link) -> LinkId {
+        let _s = self.span.enter();
+
         let slot = self.links.len();
 
         let id = LinkId(slot);
@@ -101,22 +113,26 @@ impl Node {
 
     /// Force new handshake
     pub fn queue_handshake(&self, link: LinkId, pool: impl Dequeue, net_output: impl Enqueue) {
-        let Some(index) = self.alloc_state(link) else {
+        let _s = self.span.enter();
+
+        trace!(link = ?link, "queueing handshake");
+
+        let Some(state_pos) = self.alloc_state(link) else {
             return;
         };
 
-        let state_id = link.0 * N_SESSIONS + index as usize;
-        let packet = {
+        let state_id = link.0 * N_SESSIONS + state_pos as usize;
+        let (packet, index) = {
             let mut state = self.states[state_id].write();
-            let (new_state, packet) = match state.deref_mut() {
+            let (new_state, packet, index) = match state.deref_mut() {
                 &mut SessionState::None => {
                     let Some(mut packet) = pool.pop() else {
                         return;
                     };
 
-                    let index = self.activate(state_id);
+                    let index = self.prepare_index(state_id);
 
-                    let state = {
+                    let init_state = {
                         let mut cookies = self.cookies[link.0].lock();
                         self.noise_params[link.0].format_handshake_initiation(
                             index,
@@ -125,7 +141,7 @@ impl Node {
                             &mut packet,
                         )
                     };
-                    (state, packet)
+                    (init_state, packet, index)
                 }
                 _ => {
                     // Busy
@@ -134,10 +150,11 @@ impl Node {
             };
             *state = SessionState::InitSent(new_state);
 
-            packet
+            (packet, index)
         };
 
         net_output.push(packet);
+        trace!(?link, state_id, index, "handshake sent");
     }
 
     pub fn encode_one(
@@ -147,10 +164,11 @@ impl Node {
         msg_input: impl Dequeue,
         net_output: impl Enqueue,
     ) {
+        let _s = self.span.enter();
+
         // need to ensure session
         let ses_id = self.active[link.0].load(Ordering::Relaxed);
         let state_id = link.0 * N_SESSIONS + ses_id as usize;
-
         {
             let state = self.states[state_id].read();
             match state.deref() {
@@ -159,6 +177,12 @@ impl Node {
                     if let Some(mut packet) = msg_input.pop() {
                         ses.encrypt(&mut packet);
                         net_output.push(packet);
+                        trace!(
+                            ?link,
+                            state_id,
+                            index = ses.receiving_index,
+                            "encrypting packet sent"
+                        );
                     }
                     // Encrypted packet enqueued
                     return;
@@ -179,20 +203,26 @@ impl Node {
         net_output: impl Enqueue,
         tun_output: impl Enqueue,
     ) {
-        let Some(mut packet) = net_input.pop() else {
+        let _s = self.span.enter();
+
+        let Some(packet) = net_input.pop() else {
+            debug!(?link, "no data");
             return;
         };
 
         match packet.tag() {
             Ok(tagged) => match tagged {
                 super::packet::AnyPacket::Init(packet) => {
+                    trace!(?link, "init recieved");
+
                     let recv_state = {
                         let mut last_handshake = self.last_handshake[link.0].lock();
                         match self.noise_params[link.0]
                             .receive_handshake_initiation(&mut last_handshake, &packet)
                         {
                             Ok(state) => state,
-                            Err(_) => {
+                            Err(err) => {
+                                trace!(?link, ?err, "init decode failed");
                                 pool.push(packet.into_packet());
                                 return;
                             }
@@ -201,13 +231,14 @@ impl Node {
 
                     let mut packet = packet.into_packet();
                     let Some(index) = self.alloc_state(link) else {
+                        pool.push(packet);
                         return;
                     };
                     let state_id = link.0 * N_SESSIONS + index;
-                    let idx = {
+                    let index = {
                         let mut state = self.states[state_id].write();
                         let mut cookies = self.cookies[link.0].lock();
-                        let local_index = self.activate(state_id);
+                        let local_index = self.prepare_index(state_id);
                         *state = SessionState::Active(
                             self.noise_params[link.0].format_handshake_response(
                                 recv_state,
@@ -218,17 +249,22 @@ impl Node {
                         );
                         local_index
                     };
-                    self.active[link.0].store(idx, Ordering::Relaxed);
+                    self.activate(link, index);
                     net_output.push(packet);
+                    trace!(?link, state_id, index, "reply sent")
                 }
                 super::packet::AnyPacket::Reply(packet) => {
-                    let idx = packet.receiver_idx();
-                    let Some((state_id, for_link)) = self.map_index(idx) else {
+                    trace!(?link, "reply recieved");
+
+                    let index = packet.receiver_idx();
+                    let Some((state_id, for_link)) = self.map_index(index) else {
+                        trace!(?link, index, "unknown index recieved");
                         pool.push(packet.into_packet());
                         return;
                     };
                     if for_link != link {
                         // Got a reply for an unexpected link
+                        warn!(?link, found=?for_link, "recieved packet for wrong link");
                         pool.push(packet.into_packet());
                         return;
                     }
@@ -241,7 +277,8 @@ impl Node {
                                     .receive_handshake_response(init, &packet)
                                 {
                                     Ok(ses) => ses,
-                                    Err(_) => {
+                                    Err(err) => {
+                                        trace!(?link, ?err, state_id, "failed to decode response");
                                         pool.push(packet.into_packet());
                                         return;
                                     }
@@ -249,6 +286,7 @@ impl Node {
                             }
                             _ => {
                                 // Reply for invalid sate
+                                trace!(?link, state_id, "recieved response for incorrect sate");
                                 pool.push(packet.into_packet());
                                 return;
                             }
@@ -257,17 +295,22 @@ impl Node {
                         *state = SessionState::Active(ses);
                     }
 
-                    self.active[link.0].store(idx, Ordering::Relaxed);
+                    self.activate(link, index);
                     pool.push(packet.into_packet());
                 }
                 super::packet::AnyPacket::Cookie(mut _packet) => todo!(),
                 super::packet::AnyPacket::Data(mut packet) => {
-                    let Some((state_id, for_link)) = self.map_index(packet.receiver_idx()) else {
+                    trace!(?link, "data packet recieved");
+
+                    let index = packet.receiver_idx();
+                    let Some((state_id, for_link)) = self.map_index(index) else {
+                        trace!(?link, index, "unknown index recieved");
                         pool.push(packet.into_packet());
                         return;
                     };
                     if for_link != link {
                         // Got a reply for an unexpected link
+                        warn!(?link, found=?for_link, "recieved packet for wrong link");
                         pool.push(packet.into_packet());
                         return;
                     }
@@ -275,13 +318,16 @@ impl Node {
                     // TODO(pna): this will need to be generational
                     match self.states[state_id].read().deref() {
                         SessionState::Active(ses) => {
-                            if ses.decrypt(&mut packet).is_ok() {
-                                tun_output.push(packet.into_packet());
-                            } else {
+                            if let Err(err) = ses.decrypt(&mut packet) {
+                                trace!(?link, state_id, index, ?err, "failed to decrypt packet");
                                 pool.push(packet.into_packet())
+                            } else {
+                                tun_output.push(packet.into_packet());
+                                trace!(?link, state_id, index, "decrypted packet pushed");
                             }
                         }
                         _ => {
+                            trace!(?link, state_id, "received data packet for inactive state");
                             pool.push(packet.into_packet());
                         }
                     }
@@ -289,25 +335,34 @@ impl Node {
             },
             Err(packet) => {
                 // Return packet to pool
+                trace!(?link, "unknown packet recieved");
                 pool.push(packet);
             }
         }
     }
 
     fn map_index(&self, idx: u32) -> Option<(usize, LinkId)> {
-        let id = *{ self.idx_to_state.read().1.get(&idx)? };
-        let link = LinkId(id / N_SESSIONS); // we allocate N_SESSIONS per link
-        Some((id, link))
+        let _s = self.span.enter();
+
+        let state_id = *{ self.idx_to_state.read().1.get(&idx)? };
+        let link = LinkId(state_id / N_SESSIONS); // we allocate N_SESSIONS per link
+
+        trace!(?link, state_id, index = idx, "maped index to state");
+
+        Some((state_id, link))
     }
 
     /// Try to aquire a free state for link
     fn alloc_state(&self, link: LinkId) -> Option<usize> {
+        let _s = self.span.enter();
+
         let mut busy = self.busy[link.0].lock();
         let mut index = 0..N_SESSIONS;
         // Sweep and find a free bit
         let idx = loop {
             let Some(idx) = index.next() else {
                 // No free slot
+                trace!(?link, "all states busy");
                 return None;
             };
             let spot = 1 << idx;
@@ -316,24 +371,39 @@ impl Node {
             }
         };
         *busy |= 1 << idx;
+
+        trace!(?link, index = idx, "allocated a new state");
+
         Some(idx)
     }
 
-    fn activate(&self, state_id: usize) -> u32 {
+    fn prepare_index(&self, state_id: usize) -> u32 {
+        let _s = self.span.enter();
+
         // TODO: use a pseudo random generator
         let mut next_and_map = self.idx_to_state.write();
         // TODO: need some max iter count
         while next_and_map.1.contains_key(&next_and_map.0) {
             next_and_map.0 += 1;
         }
-        let idx = next_and_map.0;
-        next_and_map.1.insert(idx, state_id);
+        let index = next_and_map.0;
+        next_and_map.1.insert(index, state_id);
         next_and_map.0 += 1;
-        idx
+
+        trace!(state_id, index, "prepared index for recieve");
+
+        index
+    }
+
+    fn activate(&self, link: LinkId, index: u32) {
+        let _s = self.span.enter();
+
+        self.active[link.0].store(index, Ordering::Relaxed);
+        trace!(?link, index, "activated new state");
     }
 }
 
-#[derive(Copy, Clone, PartialEq, Eq)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub struct LinkId(usize);
 
 pub struct Link {
@@ -362,6 +432,8 @@ mod tests {
 
     use super::*;
     use rand_core::OsRng;
+    use tracing::{subscriber, Level};
+    use tracing_subscriber::{fmt, util::SubscriberInitExt};
     use x25519_dalek::StaticSecret;
 
     impl Enqueue for &mut Vec<Packet> {
@@ -378,7 +450,7 @@ mod tests {
 
     #[test]
     pub fn test_handshaking() {
-        let mut node_a = Node::new(StaticSecret::random_from_rng(OsRng), None);
+        let mut node_a = Node::new(StaticSecret::random_from_rng(OsRng));
         let b_public = PublicKey::from(&StaticSecret::random_from_rng(OsRng));
 
         let link_ab = node_a.add_link(Link {
@@ -406,10 +478,15 @@ mod tests {
 
     #[test]
     pub fn test_communication() {
+        let _ = fmt()
+            .with_max_level(Level::TRACE)
+            .with_test_writer()
+            .try_init();
+
         let msg = b"hello mister";
 
-        let mut node_a = Node::new(StaticSecret::random_from_rng(OsRng), None);
-        let mut node_b = Node::new(StaticSecret::random_from_rng(OsRng), None);
+        let mut node_a = Node::new(StaticSecret::random_from_rng(OsRng));
+        let mut node_b = Node::new(StaticSecret::random_from_rng(OsRng));
 
         let link_ab = node_a.add_link(Link {
             public_key: node_b.public_key,
@@ -445,7 +522,7 @@ mod tests {
 
         // queue packets to b's network
         node_a.encode_one(link_ab, &mut pool, &mut msg_a_input, &mut net_b);
-        assert_eq!(net_a.len(), 1, "hanshake init sent");
+        assert_eq!(net_b.len(), 1, "hanshake init sent");
 
         // react to init from a
         node_b.decode_one(
@@ -480,6 +557,6 @@ mod tests {
             &mut msg_b_output,
         );
         assert_eq!(msg_b_output.len(), 1, "msg decoded");
-        assert_eq!(msg_b_output.pop().expect("keepalive").data_mut(), msg,);
+        assert_eq!(msg_b_output.pop().expect("data").data_mut(), msg,);
     }
 }

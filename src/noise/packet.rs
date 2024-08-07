@@ -87,9 +87,9 @@ impl Packet {
 
 impl Packet {
     pub fn tag(self) -> Result<AnyPacket, Packet> {
-        let packet_type = u32::from_le_bytes(self.data()[0..4].try_into().unwrap());
+        let packet_type = u32::from_le_bytes(self.full()[0..4].try_into().unwrap());
 
-        let tagged = match (packet_type, self.data().len()) {
+        let tagged = match (packet_type, self.full().len()) {
             (HANDSHAKE_INIT, HANDSHAKE_INIT_SZ) => AnyPacket::Init(TaggedPacket::new(self)),
             (HANDSHAKE_RESP, HANDSHAKE_RESP_SZ) => AnyPacket::Reply(TaggedPacket::new(self)),
             (COOKIE_REPLY, COOKIE_REPLY_SZ) => AnyPacket::Cookie(TaggedPacket::new(self)),
@@ -148,17 +148,17 @@ impl PacketTag for Init {}
 
 impl TaggedPacket<Init> {
     pub fn sender_idx(&self) -> u32 {
-        u32::from_le_bytes(self.data()[4..8].try_into().unwrap())
+        u32::from_le_bytes(self.full()[4..8].try_into().unwrap())
     }
     pub fn unencrypted_ephemeral(&self) -> &[u8; 32] {
-        <&[u8; 32] as TryFrom<&[u8]>>::try_from(&self.data()[8..40])
+        <&[u8; 32] as TryFrom<&[u8]>>::try_from(&self.full()[8..40])
             .expect("length already checked above")
     }
     pub fn encrypted_static(&self) -> &[u8] {
-        &self.data()[40..88]
+        &self.full()[40..88]
     }
     pub fn encrypted_timestamp(&self) -> &[u8] {
-        &self.data()[88..116]
+        &self.full()[88..116]
     }
 }
 
@@ -176,17 +176,17 @@ impl PacketTag for Reply {}
 
 impl TaggedPacket<Reply> {
     pub fn sender_idx(&self) -> u32 {
-        u32::from_le_bytes(self.data()[4..8].try_into().unwrap())
+        u32::from_le_bytes(self.full()[4..8].try_into().unwrap())
     }
     pub fn receiver_idx(&self) -> u32 {
-        u32::from_le_bytes(self.data()[8..12].try_into().unwrap())
+        u32::from_le_bytes(self.full()[8..12].try_into().unwrap())
     }
     pub fn unencrypted_ephemeral(&self) -> &[u8; 32] {
-        <&[u8; 32] as TryFrom<&[u8]>>::try_from(&self.data()[12..44])
+        <&[u8; 32] as TryFrom<&[u8]>>::try_from(&self.full()[12..44])
             .expect("length already checked above")
     }
     pub fn encrypted_nothing(&self) -> &[u8] {
-        &self.data()[44..60]
+        &self.full()[44..60]
     }
 }
 
@@ -226,7 +226,7 @@ pub struct Data;
 impl PacketTag for Data {
     fn ajust(mut packet: Packet) -> Packet {
         // TODO: unify this shananigans
-        packet.head += 16;
+        packet.head = packet.off + 16;
         packet
     }
 }
