@@ -10,7 +10,7 @@ use x25519_dalek::{PublicKey, StaticSecret};
 
 use super::{
     handshake::{Cookies, InitRecvState, InitSentState, NoiseParams, Tai64N, TimeStamper},
-    packet::{parse_incoming_packet, Packet},
+    packet::{parse_incoming_packet, Data, Init, Packet, Reply, TaggedPacket},
     session::Session,
     N_SESSIONS,
 };
@@ -213,124 +213,14 @@ impl Node {
         match packet.tag() {
             Ok(tagged) => match tagged {
                 super::packet::AnyPacket::Init(packet) => {
-                    trace!(?link, "init recieved");
-
-                    let recv_state = {
-                        let mut last_handshake = self.last_handshake[link.0].lock();
-                        match self.noise_params[link.0]
-                            .receive_handshake_initiation(&mut last_handshake, &packet)
-                        {
-                            Ok(state) => state,
-                            Err(err) => {
-                                trace!(?link, ?err, "init decode failed");
-                                pool.push(packet.into_packet());
-                                return;
-                            }
-                        }
-                    };
-
-                    let mut packet = packet.into_packet();
-                    let Some(index) = self.alloc_state(link) else {
-                        pool.push(packet);
-                        return;
-                    };
-                    let state_id = link.0 * N_SESSIONS + index;
-                    let index = {
-                        let mut state = self.states[state_id].write();
-                        let mut cookies = self.cookies[link.0].lock();
-                        let local_index = self.prepare_index(state_id);
-                        *state = SessionState::Active(
-                            self.noise_params[link.0].format_handshake_response(
-                                recv_state,
-                                local_index,
-                                &mut cookies,
-                                &mut packet,
-                            ),
-                        );
-                        local_index
-                    };
-                    self.activate(link, index);
-                    net_output.push(packet);
-                    trace!(?link, state_id, index, "reply sent")
+                    self.decode_init_one(link, packet, pool, net_output);
                 }
                 super::packet::AnyPacket::Reply(packet) => {
-                    trace!(?link, "reply recieved");
-
-                    let index = packet.receiver_idx();
-                    let Some((state_id, for_link)) = self.map_index(index) else {
-                        trace!(?link, index, "unknown index recieved");
-                        pool.push(packet.into_packet());
-                        return;
-                    };
-                    if for_link != link {
-                        // Got a reply for an unexpected link
-                        warn!(?link, found=?for_link, "recieved packet for wrong link");
-                        pool.push(packet.into_packet());
-                        return;
-                    }
-
-                    {
-                        let mut state = self.states[state_id].write();
-                        let ses = match state.deref() {
-                            SessionState::InitSent(init) => {
-                                match self.noise_params[link.0]
-                                    .receive_handshake_response(init, &packet)
-                                {
-                                    Ok(ses) => ses,
-                                    Err(err) => {
-                                        trace!(?link, ?err, state_id, "failed to decode response");
-                                        pool.push(packet.into_packet());
-                                        return;
-                                    }
-                                }
-                            }
-                            _ => {
-                                // Reply for invalid sate
-                                trace!(?link, state_id, "recieved response for incorrect sate");
-                                pool.push(packet.into_packet());
-                                return;
-                            }
-                        };
-                        // TODO: should consider index should be changed
-                        *state = SessionState::Active(ses);
-                    }
-
-                    self.activate(link, index);
-                    pool.push(packet.into_packet());
+                    self.decode_reply_one(link, packet, pool);
                 }
                 super::packet::AnyPacket::Cookie(mut _packet) => todo!(),
-                super::packet::AnyPacket::Data(mut packet) => {
-                    trace!(?link, "data packet recieved");
-
-                    let index = packet.receiver_idx();
-                    let Some((state_id, for_link)) = self.map_index(index) else {
-                        trace!(?link, index, "unknown index recieved");
-                        pool.push(packet.into_packet());
-                        return;
-                    };
-                    if for_link != link {
-                        // Got a reply for an unexpected link
-                        warn!(?link, found=?for_link, "recieved packet for wrong link");
-                        pool.push(packet.into_packet());
-                        return;
-                    }
-
-                    // TODO(pna): this will need to be generational
-                    match self.states[state_id].read().deref() {
-                        SessionState::Active(ses) => {
-                            if let Err(err) = ses.decrypt(&mut packet) {
-                                trace!(?link, state_id, index, ?err, "failed to decrypt packet");
-                                pool.push(packet.into_packet())
-                            } else {
-                                tun_output.push(packet.into_packet());
-                                trace!(?link, state_id, index, "decrypted packet pushed");
-                            }
-                        }
-                        _ => {
-                            trace!(?link, state_id, "received data packet for inactive state");
-                            pool.push(packet.into_packet());
-                        }
-                    }
+                super::packet::AnyPacket::Data(packet) => {
+                    self.decode_data_one(link, packet, pool, tun_output);
                 }
             },
             Err(packet) => {
@@ -339,6 +229,142 @@ impl Node {
                 pool.push(packet);
             }
         }
+    }
+
+    fn decode_data_one(
+        &self,
+        link: LinkId,
+        mut packet: TaggedPacket<Data>,
+        pool: impl Enqueue,
+        tun_output: impl Enqueue,
+    ) {
+        trace!(?link, "data packet recieved");
+
+        let index = packet.receiver_idx();
+        'ret: {
+            let Some((state_id, for_link)) = self.map_index(index) else {
+                trace!(?link, index, "unknown index recieved");
+                break 'ret;
+            };
+
+            if for_link != link {
+                // Got a reply for an unexpected link
+                warn!(?link, found=?for_link, "recieved packet for wrong link");
+                break 'ret;
+            }
+
+            // TODO(pna): this will need to be generational
+            match self.states[state_id].read().deref() {
+                SessionState::Active(ses) => {
+                    if let Err(err) = ses.decrypt(&mut packet) {
+                        trace!(?link, state_id, index, ?err, "failed to decrypt packet");
+                        break 'ret;
+                    } else {
+                        tun_output.push(packet.into_packet());
+                        trace!(?link, state_id, index, "decrypted packet pushed");
+                        return;
+                    }
+                }
+                _ => {
+                    trace!(?link, state_id, "received data packet for inactive state");
+                    break 'ret;
+                }
+            }
+        }
+        pool.push(packet.into_packet());
+    }
+
+    fn decode_reply_one(&self, link: LinkId, packet: TaggedPacket<Reply>, pool: impl Enqueue) {
+        trace!(?link, "reply recieved");
+        let index = packet.receiver_idx();
+
+        let index = 'ret: {
+            let Some((state_id, for_link)) = self.map_index(index) else {
+                trace!(?link, index, "unknown index recieved");
+                break 'ret None;
+            };
+
+            // TODO: proabaly treat this as precondition to function
+            if for_link != link {
+                // Got a reply for an unexpected link
+                warn!(?link, found=?for_link, "recieved packet for wrong link");
+                break 'ret None;
+            }
+
+            {
+                let mut state = self.states[state_id].write();
+                let ses = match state.deref() {
+                    SessionState::InitSent(init) => {
+                        match self.noise_params[link.0].receive_handshake_response(init, &packet) {
+                            Ok(ses) => ses,
+                            Err(err) => {
+                                trace!(?link, ?err, state_id, "failed to decode response");
+                                break 'ret None;
+                            }
+                        }
+                    }
+                    _ => {
+                        // Reply for invalid sate
+                        trace!(?link, state_id, "recieved response for incorrect sate");
+                        break 'ret None;
+                    }
+                };
+                // TODO: should consider index should be changed
+                *state = SessionState::Active(ses);
+                Some(index)
+            }
+        };
+
+        if let Some(index) = index {
+            self.activate(link, index);
+        }
+        pool.push(packet.into_packet());
+    }
+
+    fn decode_init_one(
+        &self,
+        link: LinkId,
+        packet: TaggedPacket<Init>,
+        pool: impl Enqueue,
+        net_output: impl Enqueue,
+    ) {
+        trace!(?link, "init recieved");
+
+        let recv_state = {
+            let mut last_handshake = self.last_handshake[link.0].lock();
+            match self.noise_params[link.0]
+                .receive_handshake_initiation(&mut last_handshake, &packet)
+            {
+                Ok(state) => state,
+                Err(err) => {
+                    trace!(?link, ?err, "init decode failed");
+                    pool.push(packet.into_packet());
+                    return;
+                }
+            }
+        };
+
+        let mut packet = packet.into_packet();
+        let Some(index) = self.alloc_state(link) else {
+            pool.push(packet);
+            return;
+        };
+        let state_id = link.0 * N_SESSIONS + index;
+        let index = {
+            let mut state = self.states[state_id].write();
+            let mut cookies = self.cookies[link.0].lock();
+            let local_index = self.prepare_index(state_id);
+            *state = SessionState::Active(self.noise_params[link.0].format_handshake_response(
+                recv_state,
+                local_index,
+                &mut cookies,
+                &mut packet,
+            ));
+            local_index
+        };
+        self.activate(link, index);
+        net_output.push(packet);
+        trace!(?link, state_id, index, "reply sent")
     }
 
     fn map_index(&self, idx: u32) -> Option<(usize, LinkId)> {
