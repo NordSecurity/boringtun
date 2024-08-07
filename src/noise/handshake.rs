@@ -656,9 +656,9 @@ impl NoiseParams {
         Session::new(index, peer_index, temp2, temp3)
     }
 
-    pub(super) fn receive_handshake_response(
+    pub fn receive_handshake_response(
         &self,
-        state: InitSentState,
+        state: &InitSentState,
         packet: &TaggedPacket<Reply>,
     ) -> Result<Session, WireGuardError> {
         // Check if there is a handshake awaiting a response and return the correct one

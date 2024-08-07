@@ -14,18 +14,17 @@ use super::{
     N_SESSIONS,
 };
 
-pub trait QueueIn {
-    fn push(self, packet: Packet);
+pub trait Enqueue<T: Sized + Send + 'static = Packet> {
+    fn push(self, packet: T);
 }
 
-pub trait QueueOut {
+pub trait Dequeue<T: Sized + Send + 'static = Packet> {
     fn pop(self) -> Option<Packet>;
 }
 
 pub enum SessionState {
     None,
     InitSent(InitSentState),
-    InitRecv(InitRecvState),
     Active(Session),
 }
 
@@ -63,6 +62,7 @@ impl Node {
             links: HashMap::new(),
             noise_params: Vec::new(),
             cookies: Vec::new(),
+            last_handshake: Vec::new(),
             active: Vec::new(),
             busy: Vec::new(),
 
@@ -85,6 +85,7 @@ impl Node {
             ));
             self.cookies.push(Mutex::new(Cookies::default()));
             self.last_handshake.push(Mutex::new(Tai64N::zero()));
+
             self.active.push(AtomicU32::new(0));
             self.busy.push(Mutex::new(0));
 
@@ -99,7 +100,7 @@ impl Node {
     }
 
     /// Force new handshake
-    pub fn queue_handshake(&self, link: LinkId, pool: impl QueueOut, net_output: impl QueueIn) {
+    pub fn queue_handshake(&self, link: LinkId, pool: impl Dequeue, net_output: impl Enqueue) {
         let Some(index) = self.alloc_state(link) else {
             return;
         };
@@ -142,9 +143,9 @@ impl Node {
     pub fn encode_one(
         &self,
         link: LinkId,
-        pool: impl QueueOut,
-        msg_input: impl QueueOut,
-        net_output: impl QueueIn,
+        pool: impl Dequeue,
+        msg_input: impl Dequeue,
+        net_output: impl Enqueue,
     ) {
         // need to ensure session
         let ses_id = self.active[link.0].load(Ordering::Relaxed);
@@ -173,18 +174,18 @@ impl Node {
     pub fn decode_one(
         &self,
         link: LinkId,
-        pool: impl QueueIn,
-        net_out: impl QueueOut,
-        net_in: impl QueueIn,
-        tun_in: impl QueueIn,
+        pool: impl Enqueue,
+        net_input: impl Dequeue,
+        net_output: impl Enqueue,
+        tun_output: impl Enqueue,
     ) {
-        let Some(mut packet) = net_out.pop() else {
+        let Some(mut packet) = net_input.pop() else {
             return;
         };
 
         match packet.tag() {
             Ok(tagged) => match tagged {
-                super::packet::AnyPacket::Init(mut packet) => {
+                super::packet::AnyPacket::Init(packet) => {
                     let recv_state = {
                         let mut last_handshake = self.last_handshake[link.0].lock();
                         match self.noise_params[link.0]
@@ -203,7 +204,7 @@ impl Node {
                         return;
                     };
                     let state_id = link.0 * N_SESSIONS + index;
-                    {
+                    let idx = {
                         let mut state = self.states[state_id].write();
                         let mut cookies = self.cookies[link.0].lock();
                         let local_index = self.activate(state_id);
@@ -214,29 +215,71 @@ impl Node {
                                 &mut cookies,
                                 &mut packet,
                             ),
-                        )
-                    }
+                        );
+                        local_index
+                    };
+                    self.active[link.0].store(idx, Ordering::Relaxed);
+                    net_output.push(packet);
                 }
-                super::packet::AnyPacket::Reply(mut packet) => todo!(),
-                super::packet::AnyPacket::Cookie(mut packet) => todo!(),
-                super::packet::AnyPacket::Data(mut packet) => {
-                    let Some((idx, state_id)) = self
-                        .idx_to_state
-                        .read()
-                        .1
-                        .get_key_value(&packet.receiver_idx())
-                        .map(|(k, v)| (*k, *v))
-                        .clone()
-                    else {
+                super::packet::AnyPacket::Reply(packet) => {
+                    let idx = packet.receiver_idx();
+                    let Some((state_id, for_link)) = self.map_index(idx) else {
+                        pool.push(packet.into_packet());
                         return;
                     };
-                    debug_assert!(state_id / N_SESSIONS == link.0);
+                    if for_link != link {
+                        // Got a reply for an unexpected link
+                        pool.push(packet.into_packet());
+                        return;
+                    }
+
+                    {
+                        let mut state = self.states[state_id].write();
+                        let ses = match state.deref() {
+                            SessionState::InitSent(init) => {
+                                match self.noise_params[link.0]
+                                    .receive_handshake_response(init, &packet)
+                                {
+                                    Ok(ses) => ses,
+                                    Err(_) => {
+                                        pool.push(packet.into_packet());
+                                        return;
+                                    }
+                                }
+                            }
+                            _ => {
+                                // Reply for invalid sate
+                                pool.push(packet.into_packet());
+                                return;
+                            }
+                        };
+                        // TODO: should consider index should be changed
+                        *state = SessionState::Active(ses);
+                    }
+
+                    self.active[link.0].store(idx, Ordering::Relaxed);
+                    pool.push(packet.into_packet());
+                }
+                super::packet::AnyPacket::Cookie(mut _packet) => todo!(),
+                super::packet::AnyPacket::Data(mut packet) => {
+                    let Some((state_id, for_link)) = self.map_index(packet.receiver_idx()) else {
+                        pool.push(packet.into_packet());
+                        return;
+                    };
+                    if for_link != link {
+                        // Got a reply for an unexpected link
+                        pool.push(packet.into_packet());
+                        return;
+                    }
 
                     // TODO(pna): this will need to be generational
                     match self.states[state_id].read().deref() {
                         SessionState::Active(ses) => {
-                            ses.decrypt(&mut packet);
-                            tun_in.push(packet.into_packet());
+                            if ses.decrypt(&mut packet).is_ok() {
+                                tun_output.push(packet.into_packet());
+                            } else {
+                                pool.push(packet.into_packet())
+                            }
                         }
                         _ => {
                             pool.push(packet.into_packet());
@@ -249,26 +292,12 @@ impl Node {
                 pool.push(packet);
             }
         }
+    }
 
-        // TODO: rate limiter should be used here
-        // let Ok(tagged) = parse_incoming_packet(packet.full()) else {
-        //     return;
-        // };
-
-        // enum Act { Init }
-        // let action = match tagged {
-        //     super::packet::TaggedPacket::HandshakeInit(init) => {
-        //         Act::Init
-        //     },
-        //     super::packet::TaggedPacket::HandshakeResponse(resp) => todo!(),
-        //     super::packet::TaggedPacket::PacketCookieReply(_) => todo!(),
-        //     super::packet::TaggedPacket::PacketData(data) => todo!(),
-        // }
-        // match action {
-        //     Act::Init => {
-        //         self.
-        //     },
-        // }
+    fn map_index(&self, idx: u32) -> Option<(usize, LinkId)> {
+        let id = *{ self.idx_to_state.read().1.get(&idx)? };
+        let link = LinkId(id / N_SESSIONS); // we allocate N_SESSIONS per link
+        Some((id, link))
     }
 
     /// Try to aquire a free state for link
@@ -304,7 +333,7 @@ impl Node {
     }
 }
 
-#[derive(Copy, Clone)]
+#[derive(Copy, Clone, PartialEq, Eq)]
 pub struct LinkId(usize);
 
 pub struct Link {
@@ -335,13 +364,13 @@ mod tests {
     use rand_core::OsRng;
     use x25519_dalek::StaticSecret;
 
-    impl QueueIn for &mut Vec<Packet> {
+    impl Enqueue for &mut Vec<Packet> {
         fn push(self, packet: Packet) {
             self.push(packet);
         }
     }
 
-    impl QueueOut for &mut Vec<Packet> {
+    impl Dequeue for &mut Vec<Packet> {
         fn pop(self) -> Option<Packet> {
             self.pop()
         }
