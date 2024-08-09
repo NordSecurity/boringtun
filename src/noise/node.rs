@@ -5,12 +5,12 @@ use std::{
 };
 
 use parking_lot::{Mutex, RwLock};
-use tracing::{debug, info_span, trace, trace_span, warn, Span};
+use tracing::{debug, info_span, trace, warn, Span};
 use x25519_dalek::{PublicKey, StaticSecret};
 
 use super::{
-    handshake::{Cookies, InitRecvState, InitSentState, NoiseParams, Tai64N, TimeStamper},
-    packet::{parse_incoming_packet, Data, Init, Packet, Reply, TaggedPacket},
+    handshake::{Cookies, InitSentState, NoiseParams, Tai64N, TimeStamper},
+    packet::{Data, Init, Packet, Reply, TaggedPacket},
     session::Session,
     N_SESSIONS,
 };
@@ -458,8 +458,8 @@ mod tests {
 
     use super::*;
     use rand_core::OsRng;
-    use tracing::{subscriber, Level};
-    use tracing_subscriber::{fmt, util::SubscriberInitExt};
+    use tracing::Level;
+    use tracing_subscriber::fmt;
     use x25519_dalek::StaticSecret;
 
     impl Enqueue for &mut Vec<Packet> {
