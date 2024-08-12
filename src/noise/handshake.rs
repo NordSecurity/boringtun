@@ -388,7 +388,7 @@ impl NoiseParams {
     }
 
     /// Set a new private key
-    fn set_static_private(
+    pub fn set_static_private(
         &mut self,
         static_private: x25519::StaticSecret,
         static_public: x25519::PublicKey,

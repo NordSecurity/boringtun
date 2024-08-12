@@ -2,6 +2,7 @@ use std::{
     collections::HashMap,
     ops::{Deref, DerefMut},
     sync::atomic::{AtomicU32, Ordering},
+    time::Duration,
 };
 
 use parking_lot::{Mutex, RwLock};
@@ -12,6 +13,7 @@ use super::{
     handshake::{Cookies, InitSentState, NoiseParams, Tai64N, TimeStamper},
     packet::{Data, Init, Packet, Reply, TaggedPacket},
     session::Session,
+    timers::Timers,
     N_SESSIONS,
 };
 
@@ -30,8 +32,7 @@ pub enum SessionState {
 }
 
 pub struct Node {
-    pub public_key: PublicKey,
-    secret_key: StaticSecret,
+    key_pair: Option<(StaticSecret, PublicKey)>,
 
     stamper: TimeStamper,
 
@@ -45,6 +46,9 @@ pub struct Node {
     // Maybe smarter to use a lock free set
     busy: Vec<Mutex<u32>>,
 
+    now: RwLock<Duration>,
+    timings: Vec<RwLock<Timers>>,
+
     // Per session data
     states: Vec<RwLock<SessionState>>,
 
@@ -55,16 +59,11 @@ pub struct Node {
 }
 
 impl Node {
-    pub fn new(ss: StaticSecret) -> Self {
-        let public_key = PublicKey::from(&ss);
-        let mut pk = base64::encode(public_key);
-        let _ = pk.split_off(4);
-        let span = info_span!("node", pk = pk);
-
+    pub fn new() -> Self {
         Self {
-            secret_key: ss,
-            public_key,
-
+            key_pair: None,
+            // secret_key: ss,
+            // public_key,
             stamper: TimeStamper::new(),
 
             links: HashMap::new(),
@@ -74,24 +73,59 @@ impl Node {
             active: Vec::new(),
             busy: Vec::new(),
 
+            now: RwLock::new(Duration::new(0, 0)),
+            timings: Vec::new(),
+
             states: Vec::new(),
 
             idx_to_state: RwLock::new((0, HashMap::new())),
 
-            span,
+            span: info_span!("node", pk = "<not-set>"),
         }
+    }
+
+    pub fn set_secret_key(&mut self, sk: StaticSecret) {
+        let public_key = PublicKey::from(&sk);
+        let mut pk = base64::encode(public_key);
+        let _ = pk.split_off(4);
+        let span = info_span!("node", pk = pk);
+        self.span = span;
+
+        for param in &mut self.noise_params {
+            param.set_static_private(sk.clone(), public_key);
+        }
+        for state in &self.states {
+            *state.write() = SessionState::None;
+        }
+        for mask in &self.busy {
+            *mask.lock() = 0;
+        }
+        for active in &self.active {
+            active.store(0, Ordering::Relaxed);
+        }
+        self.idx_to_state.write().1.clear();
+
+        self.key_pair = Some((sk, public_key));
+    }
+
+    pub fn get_link(&self, pub_key: &PublicKey) -> Option<LinkId> {
+        self.links.get(pub_key).cloned()
     }
 
     pub fn add_link(&mut self, config: Link) -> LinkId {
         let _s = self.span.enter();
+
+        let Some((sk, pk)) = self.key_pair.as_ref() else {
+            panic!("secret key was not set")
+        };
 
         let slot = self.links.len();
 
         let id = LinkId(slot);
         if slot == self.links.len() {
             self.noise_params.push(NoiseParams::new(
-                self.secret_key.clone(),
-                self.public_key,
+                sk.clone(),
+                *pk,
                 config.public_key,
                 config.preshared_key,
             ));
@@ -101,6 +135,9 @@ impl Node {
             self.active.push(AtomicU32::new(0));
             self.busy.push(Mutex::new(0));
 
+            self.timings
+                .push(RwLock::new(Timers::new(config.keepalive, false)));
+
             for _ in 0..N_SESSIONS {
                 self.states.push(RwLock::new(SessionState::None));
             }
@@ -109,6 +146,10 @@ impl Node {
         }
         self.links.insert(config.public_key, id);
         id
+    }
+
+    pub fn update_timers(&self) {
+        for timing in &self.timings {}
     }
 
     /// Force new handshake
@@ -295,7 +336,7 @@ impl Node {
                 let mut state = self.states[state_id].write();
                 let ses = match state.deref() {
                     SessionState::InitSent(init) => {
-                        match self.noise_params[link.0].receive_handshake_response(init, &packet) {
+                        match self.noise_params[link.0].receive_handshake_response(&init, &packet) {
                             Ok(ses) => ses,
                             Err(err) => {
                                 trace!(?link, ?err, state_id, "failed to decode response");
@@ -435,6 +476,7 @@ pub struct LinkId(usize);
 pub struct Link {
     pub public_key: PublicKey,
     pub preshared_key: Option<[u8; 32]>,
+    pub keepalive: Option<u16>,
 }
 
 impl Default for Link {
@@ -442,6 +484,7 @@ impl Default for Link {
         Self {
             public_key: PublicKey::from([0u8; 32]),
             preshared_key: None,
+            keepalive: None,
         }
     }
 }
@@ -476,7 +519,13 @@ mod tests {
 
     #[test]
     pub fn test_handshaking() {
-        let mut node_a = Node::new(StaticSecret::random_from_rng(OsRng));
+        let (a_sk, a_pk) = {
+            let sk = StaticSecret::random_from_rng(OsRng);
+            let pk = PublicKey::from(&sk);
+            (sk, pk)
+        };
+        let mut node_a = Node::new();
+        node_a.set_secret_key(a_sk);
         let b_public = PublicKey::from(&StaticSecret::random_from_rng(OsRng));
 
         let link_ab = node_a.add_link(Link {
@@ -511,15 +560,28 @@ mod tests {
 
         let msg = b"hello mister";
 
-        let mut node_a = Node::new(StaticSecret::random_from_rng(OsRng));
-        let mut node_b = Node::new(StaticSecret::random_from_rng(OsRng));
+        let (a_sk, a_pk) = {
+            let sk = StaticSecret::random_from_rng(OsRng);
+            let pk = PublicKey::from(&sk);
+            (sk, pk)
+        };
+        let (b_sk, b_pk) = {
+            let sk = StaticSecret::random_from_rng(OsRng);
+            let pk = PublicKey::from(&sk);
+            (sk, pk)
+        };
+
+        let mut node_a = Node::new();
+        node_a.set_secret_key(a_sk);
+        let mut node_b = Node::new();
+        node_b.set_secret_key(b_sk);
 
         let link_ab = node_a.add_link(Link {
-            public_key: node_b.public_key,
+            public_key: b_pk,
             ..default()
         });
         let link_ba = node_b.add_link(Link {
-            public_key: node_a.public_key,
+            public_key: a_pk,
             ..default()
         });
 
@@ -585,4 +647,37 @@ mod tests {
         assert_eq!(msg_b_output.len(), 1, "msg decoded");
         assert_eq!(msg_b_output.pop().expect("data").data_mut(), msg,);
     }
+
+    // #[test]
+    // fn test_connction_timmings() {
+    //     let mut node_a = Node::new(StaticSecret::random_from_rng(OsRng));
+    //     let mut node_b = Node::new(StaticSecret::random_from_rng(OsRng));
+
+    //     let link_ab = node_a.add_link(Link {
+    //         public_key: node_b.public_key,
+    //         ..default()
+    //     });
+    //     let link_ba = node_b.add_link(Link {
+    //         public_key: node_a.public_key,
+    //         ..default()
+    //     });
+
+    //     let mut pool = Vec::new();
+    //     pool.extend(repeat(Packet::new(80, 1420)).take(32));
+
+    //     // messages in a network
+    //     let mut net_a = Vec::new();
+    //     // messages in b network
+    //     let mut net_b = Vec::new();
+
+    //     // a plaintext input
+    //     let mut msg_a_input = Vec::new();
+    //     // b plaintext output
+    //     let mut msg_a_output = Vec::new();
+
+    //     // b plaintext input
+    //     // let mut msg_b_input = Vec::new();
+    //     // b plaintext output
+    //     let mut msg_b_output = Vec::new();
+    // }
 }

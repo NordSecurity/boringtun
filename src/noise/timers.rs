@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: BSD-3-Clause
 
 use super::errors::WireGuardError;
+use super::node::Node;
 use crate::noise::{safe_duration::SafeDuration as Duration, TunnResult};
 use std::mem;
 use std::ops::{Index, IndexMut};
@@ -127,9 +128,10 @@ impl IndexMut<TimerName> for Timers {
 }
 
 #[cfg(never)]
-impl Tunn {
-    pub(super) fn timer_tick(&mut self, timer_name: TimerName) {
-        let time = self.timers[TimeCurrent];
+impl Node {
+    pub fn timer_tick(&self, link: LinkId, timer_name: TimerName) {
+        let time = self.now.read();
+        // let time = self.timers[TimeCurrent];
         match timer_name {
             TimeLastPacketReceived => {
                 self.timers.want_keepalive = true;
