@@ -148,9 +148,9 @@ impl Node {
         id
     }
 
-    pub fn update_timers(&self) {
-        for timing in &self.timings {}
-    }
+    // pub fn tick_with_now(&self, now: Duration) {
+    // for timing in &self.timings {}
+    // }
 
     /// Force new handshake
     pub fn queue_handshake(&self, link: LinkId, pool: impl Dequeue, net_output: impl Enqueue) {
@@ -558,126 +558,102 @@ mod tests {
             .with_test_writer()
             .try_init();
 
-        let msg = b"hello mister";
-
-        let (a_sk, a_pk) = {
-            let sk = StaticSecret::random_from_rng(OsRng);
-            let pk = PublicKey::from(&sk);
-            (sk, pk)
-        };
-        let (b_sk, b_pk) = {
-            let sk = StaticSecret::random_from_rng(OsRng);
-            let pk = PublicKey::from(&sk);
-            (sk, pk)
-        };
-
-        let mut node_a = Node::new();
-        node_a.set_secret_key(a_sk);
-        let mut node_b = Node::new();
-        node_b.set_secret_key(b_sk);
-
-        let link_ab = node_a.add_link(Link {
-            public_key: b_pk,
-            ..default()
+        let mut a = Setup::build();
+        let mut b = Setup::build();
+        let link_ab = a.node.add_link(Link {
+            public_key: b.pk,
+            ..Default::default()
         });
-        let link_ba = node_b.add_link(Link {
-            public_key: a_pk,
-            ..default()
+        let link_ba = b.node.add_link(Link {
+            public_key: a.pk,
+            ..Default::default()
         });
 
-        let mut pool = Vec::new();
-        pool.extend(repeat(Packet::new(80, 1420)).take(32));
+        let msg = b"hello from a";
 
-        // messages in a network
-        let mut net_a = Vec::new();
-        // messages in b network
-        let mut net_b = Vec::new();
-
-        // a plaintext input
-        let mut msg_a_input = Vec::new();
-        // b plaintext output
-        let mut msg_a_output = Vec::new();
-
-        // b plaintext input
-        // let mut msg_b_input = Vec::new();
-        // b plaintext output
-        let mut msg_b_output = Vec::new();
-
-        let mut packet = pool.pop().unwrap();
+        let mut packet = a.pool.pop().unwrap();
         packet.write_data(msg);
-
-        msg_a_input.push(packet);
+        a.input.push(packet);
 
         // queue packets to b's network
-        node_a.encode_one(link_ab, &mut pool, &mut msg_a_input, &mut net_b);
-        assert_eq!(net_b.len(), 1, "hanshake init sent");
+        a.node
+            .encode_one(link_ab, &mut a.pool, &mut a.input, &mut b.net);
+        assert_eq!(b.net.len(), 1, "hanshake init sent");
 
         // react to init from a
-        node_b.decode_one(
-            link_ba,
-            &mut pool,
-            &mut net_b,
-            &mut net_a,
-            &mut msg_b_output,
-        );
-        assert_eq!(net_a.len(), 1, "hanshake reply sent");
+        b.node
+            .decode_one(link_ba, &mut b.pool, &mut b.net, &mut a.net, &mut b.output);
+        assert_eq!(a.net.len(), 1, "hanshake reply sent");
 
         // react to reply from b
-        node_a.decode_one(
-            link_ab,
-            &mut pool,
-            &mut net_a,
-            &mut net_b,
-            &mut msg_a_output,
-        );
-        assert_eq!(net_a.len(), 0, "reply consumed");
+        a.node
+            .decode_one(link_ab, &mut a.pool, &mut a.net, &mut b.net, &mut a.output);
+        assert_eq!(a.net.len(), 0, "reply consumed");
 
         // send actual message
-        node_a.encode_one(link_ab, &mut pool, &mut msg_a_input, &mut net_b);
-        assert_eq!(net_b.len(), 1, "data encoded");
+        a.node
+            .encode_one(link_ab, &mut a.pool, &mut a.input, &mut b.net);
+        assert_eq!(b.net.len(), 1, "data encoded");
 
-        // react to init from a
-        node_b.decode_one(
-            link_ba,
-            &mut pool,
-            &mut net_b,
-            &mut net_a,
-            &mut msg_b_output,
-        );
-        assert_eq!(msg_b_output.len(), 1, "msg decoded");
-        assert_eq!(msg_b_output.pop().expect("data").data_mut(), msg,);
+        // decode message
+        b.node
+            .decode_one(link_ba, &mut b.pool, &mut b.net, &mut a.net, &mut b.output);
+        assert_eq!(b.output.len(), 1, "msg decoded");
+        assert_eq!(b.output.pop().expect("data").data_mut(), msg);
     }
 
     // #[test]
     // fn test_connction_timmings() {
-    //     let mut node_a = Node::new(StaticSecret::random_from_rng(OsRng));
-    //     let mut node_b = Node::new(StaticSecret::random_from_rng(OsRng));
+    //     let _ = fmt()
+    //         .with_max_level(Level::TRACE)
+    //         .with_test_writer()
+    //         .try_init();
 
-    //     let link_ab = node_a.add_link(Link {
-    //         public_key: node_b.public_key,
-    //         ..default()
+    //     let mut a = Setup::build();
+    //     let mut b = Setup::build();
+
+    //     let link_ab = a.node.add_link(Link {
+    //         public_key: b.pk,
+    //         keepalive: Some(25),
+    //         ..Default::default()
     //     });
-    //     let link_ba = node_b.add_link(Link {
-    //         public_key: node_a.public_key,
-    //         ..default()
+
+    //     let link_ba = b.node.add_link(Link {
+    //         public_key: a.pk,
+    //         ..Default::default()
     //     });
 
-    //     let mut pool = Vec::new();
-    //     pool.extend(repeat(Packet::new(80, 1420)).take(32));
+    //     let now = Duration::from_secs(0);
 
-    //     // messages in a network
-    //     let mut net_a = Vec::new();
-    //     // messages in b network
-    //     let mut net_b = Vec::new();
+    //     // let mut net
 
-    //     // a plaintext input
-    //     let mut msg_a_input = Vec::new();
-    //     // b plaintext output
-    //     let mut msg_a_output = Vec::new();
-
-    //     // b plaintext input
-    //     // let mut msg_b_input = Vec::new();
-    //     // b plaintext output
-    //     let mut msg_b_output = Vec::new();
+    //     // a.tick_with_now(now, &mut b.net);
     // }
+
+    struct Setup {
+        pk: PublicKey,
+        node: Node,
+        net: Vec<Packet>,
+        input: Vec<Packet>,
+        output: Vec<Packet>,
+        pool: Vec<Packet>,
+    }
+
+    impl Setup {
+        fn build() -> Self {
+            let sk = StaticSecret::random_from_rng(OsRng);
+            let pk = PublicKey::from(&sk);
+            let mut node = Node::new();
+            node.set_secret_key(sk);
+
+            Self {
+                pk,
+                node,
+                net: vec![],
+                input: vec![],
+                output: vec![],
+                pool: vec![Packet::new(80, 1420); 32],
+            }
+        }
+    }
 }
