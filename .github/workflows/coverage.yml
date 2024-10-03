@@ -1,0 +1,32 @@
+name: Coverage
+on: [pull_request]
+permissions:
+  pull-requests: write
+
+
+jobs:
+  test:
+    name: coverage
+    runs-on: ubuntu-latest
+    container:
+      image: xd009642/tarpaulin:develop-nightly
+      options: --security-opt seccomp=unconfined
+    steps:
+    - uses: actions/checkout@a5ac7e51b41094c92402da3b24376905380afc29 # v4.1.6
+      with:
+        ref: ${{ github.event.pull_request.base.sha }}
+    - name: Generate base code coverage
+      run: |
+        cargo +nightly tarpaulin --verbose --all-features --workspace --out lcov
+        mv ./lcov.info ./base.lcov.info
+    - uses: actions/checkout@a5ac7e51b41094c92402da3b24376905380afc29 # v4.1.6
+      with:
+        ref: ${{ github.event.pull_request.head.sha }}
+    - name: Generate code coverage
+      run: |
+        cargo +nightly tarpaulin --verbose --all-features --workspace --out lcov
+    - name: Upload to codecov.io
+      uses: romeovs/lcov-reporter-action@87a815f34ec27a5826abba44ce09bbc688da58fd
+      with:
+        lcov-file: ./lcov.info
+        lcov-base: ./base.lcov.info
