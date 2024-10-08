@@ -17,15 +17,19 @@ jobs:
         ref: ${{ github.event.pull_request.base.sha }}
     - name: Generate base code coverage
       run: |
-        cargo +nightly tarpaulin -p boringtun --verbose --all-features --out lcov
+        cargo +nightly tarpaulin -p boringtun --verbose --all-features --out xml
         mv ./lcov.info ./base.lcov.info
     - uses: actions/checkout@a5ac7e51b41094c92402da3b24376905380afc29 # v4.1.6
       with:
         ref: ${{ github.event.pull_request.head.sha }}
     - name: Generate code coverage
-      run: cargo +nightly tarpaulin -p boringtun --verbose --all-features --out lcov
+      run: cargo +nightly tarpaulin -p boringtun --verbose --all-features --out xml
     - name: Print PR report
-      uses: romeovs/lcov-reporter-action@87a815f34ec27a5826abba44ce09bbc688da58fd
+      uses: irongut/CodeCoverageSummary@51cc3a756ddcd398d447c044c02cb6aa83fdae95 # v1.3.0
       with:
-        lcov-file: ./lcov.info
-        #lcov-base: ./base.lcov.info
+        filename: ./cobertura.xml
+    - name: Add Coverage PR Comment
+      uses: marocchino/sticky-pull-request-comment@331f8f5b4215f0445d3c07b4967662a32a2d3e31 # v2.9.0
+      with:
+        recreate: true
+        path: code-coverage-results.md
