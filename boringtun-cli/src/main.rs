@@ -21,6 +21,7 @@ fn check_tun_name(name: &str) -> Result<String, String> {
             Err("Tunnel name must have the format 'utun[0-9]+', use 'utun' for automatic assignment".to_owned())
         }
     }
+    #[cfg(not(target_os = "macos"))]
     {
         Ok(name.to_owned())
     }
@@ -98,10 +99,7 @@ fn main() {
     #[cfg(target_os = "linux")]
     let uapi_fd: i32 = *matches.get_one("uapi-fd").unwrap();
     let tun_fd: isize = *matches.get_one("tun-fd").unwrap();
-    let mut tun_name: String = matches
-        .get_one::<String>("INTERFACE_NAME")
-        .unwrap()
-        .clone();
+    let mut tun_name: String = matches.get_one::<String>("INTERFACE_NAME").unwrap().clone();
     if tun_fd >= 0 {
         tun_name = matches.get_one::<String>("tun-fd").unwrap().clone();
     }
