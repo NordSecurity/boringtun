@@ -94,7 +94,7 @@ impl ReceivingKeyCounterValidator {
         if !self.check_bit(counter) {
             Ok(())
         } else {
-            tracing::debug!(message=format!("DBG: {:?}", self));
+            tracing::debug!(message=format!("DBG: {:?} Cnt: {:?}", self, counter));
             Err(WireGuardError::DuplicateCounter)
         }
     }
