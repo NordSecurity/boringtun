@@ -83,7 +83,6 @@ impl ReceivingKeyCounterValidator {
     /// Returns true if the counter was not yet received, and is not too far back
     #[inline(always)]
     fn will_accept(&self, counter: u64) -> Result<(), WireGuardError> {
-        tracing::debug!(message=format!("Validator state at acceptance: {:?}", self));
         if counter >= self.next {
             // As long as the counter is growing no replay took place for sure
             return Ok(());
@@ -95,6 +94,7 @@ impl ReceivingKeyCounterValidator {
         if !self.check_bit(counter) {
             Ok(())
         } else {
+            tracing::debug!(message=format!("DBG: {:?}", self));
             Err(WireGuardError::DuplicateCounter)
         }
     }
@@ -103,7 +103,7 @@ impl ReceivingKeyCounterValidator {
     /// decryption something changed)
     #[inline(always)]
     fn mark_did_receive(&mut self, counter: u64) -> Result<(), WireGuardError> {
-        tracing::debug!(message=format!("Validator state before marking receivd packet {:?}", self));
+        tracing::debug!(message=format!("DBG: {:?}, Cnt: {:?}", self, counter));
         if counter + N_BITS < self.next {
             // Drop if too far back
             return Err(WireGuardError::InvalidCounter);
@@ -113,7 +113,6 @@ impl ReceivingKeyCounterValidator {
             // increment the counter
             self.set_bit(counter);
             self.next += 1;
-            tracing::debug!(message=format!("Validator state after marking receivd packet {:?}", self));
             return Ok(());
         }
         if counter < self.next {
@@ -122,7 +121,6 @@ impl ReceivingKeyCounterValidator {
                 return Err(WireGuardError::InvalidCounter);
             }
             self.set_bit(counter);
-            tracing::debug!(message=format!("Validator state after marking receivd packet {:?}", self));
             return Ok(());
         }
         // Packets where dropped, or maybe reordered, skip them and mark unused
@@ -151,8 +149,6 @@ impl ReceivingKeyCounterValidator {
         }
         self.set_bit(counter);
         self.next = counter + 1;
-
-        tracing::debug!(message=format!("Validator state after marking receivd packet {:?}", self));
         Ok(())
     }
 }
@@ -183,14 +179,12 @@ impl Session {
     /// Returns true if receiving counter is good to use
     fn receiving_counter_quick_check(&self, counter: u64) -> Result<(), WireGuardError> {
         let counter_validator = self.receiving_key_counter.lock();
-        tracing::debug!("Validating received packet counter for: tx {:?}, rx {:?}", self.sending_index, self.receiving_index);
         counter_validator.will_accept(counter)
     }
 
     /// Returns true if receiving counter is good to use, and marks it as used {
     fn receiving_counter_mark(&self, counter: u64) -> Result<(), WireGuardError> {
         let mut counter_validator = self.receiving_key_counter.lock();
-        tracing::debug!("Validating received packet counter for: tx {:?}, rx {:?}", self.sending_index, self.receiving_index);
         let ret = counter_validator.mark_did_receive(counter);
         if ret.is_ok() {
             counter_validator.receive_cnt += 1;
